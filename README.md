@@ -1,360 +1,260 @@
-<div align="center">
+# Principia v1.0
 
-# Principia
+Principia is a local-first research ideation system for building high-quality, evidence-grounded ideas from papers, benchmarks, baselines, principles, and generated symbolic derivations.
 
-### Principle-First Automatic Idea Discovery System
+Version 1.0 upgrades the earlier Principia 0.x demo into a product-oriented codebase with normalized research memory, live research workflows, concept-level retrieval, traceable idea generation, and an MVP of **Principia Calculus**, a symbolic mode for deriving new ideas through verified lineage graphs instead of opaque one-shot text generation.
 
-**Ideas from principles. Evidence before hype. Validation before papers.**
+Business collaboration: [peizhengqi@chipflow.net](mailto:peizhengqi@chipflow.net)  
+Academic collaboration: [peizhengqi22@mails.ucas.ac.cn](mailto:peizhengqi22@mails.ucas.ac.cn)
 
-[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](#quick-start)
-[![Local First](https://img.shields.io/badge/local--first-research_workspace-0ea5e9)](#local-first-by-design)
-[![SQLite](https://img.shields.io/badge/storage-SQLite-003B57?logo=sqlite&logoColor=white)](#architecture)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#contributing)
+## Screenshots
 
-<a href="#why-principia">Why Principia</a> ·
-<a href="#quick-start">Quick Start</a> ·
-<a href="#what-you-can-do-today">Current Demo</a> ·
-<a href="#architecture">Architecture</a> ·
-<a href="#roadmap">Roadmap</a>
-
-</div>
-
----
-
-## Why Principia
-
-Most AI research ideation tools can produce a fluent paragraph. Principia is built around a harder question:
-
-> **Where did this idea come from, what principle makes it plausible, and how can we test it?**
-
-Principia turns a rough research goal or idea draft into a structured local research workspace. It searches public scholarly metadata, extracts reusable field knowledge, organizes that knowledge into a growing principle library, and helps researchers generate new ideas whose evidence, assumptions, baselines, risks, and validation paths are visible.
-
-The name is deliberate. **Principia** is not just an idea generator. It is a principle-oriented research instrument: a place to turn literature into reusable principles, turn principles into traceable ideas, and turn feedback from experiments back into better research memory.
-
-## Core Thesis
-
-```text
-Research idea = Goal
-              + Evidence
-              + Principle lineage
-              + Idea operator
-              + Novelty contrast
-              + Validation plan
-              + Feedback loop
-```
-
-Principia is designed for researchers who do not merely want *more* ideas. They want ideas with visible origin, explicit assumptions, comparable prior work, and a path toward validation.
-
-## What You Can Do Today
-
-This repository is a local demo of the Principia workflow.
-
-| Capability | What it does |
+| Research workspace | Works library |
 | --- | --- |
-| **Project workspace** | Create project-scoped research spaces instead of losing ideas in chat history. |
-| **Hybrid source discovery** | Searches free public metadata sources including arXiv, OpenAlex, and Crossref, then ranks and deduplicates relevant works. |
-| **Evidence library** | Structures a project into Existed Ideas, Principles, Takeaway Messages, Benchmarks, Baselines, and My Ideas. |
-| **Principle mining** | Extracts reusable mechanisms, assumptions, tradeoffs, failure modes, and transfer hooks from prior work. |
-| **Principle-first idea generation** | Generates new ideas from selected existed ideas, principles, takeaway messages, and the user's own hunch. |
-| **Idea detail page** | Shows novelty claim, mechanistic design, why it might work, validation protocol, metrics, risks, related existed ideas, principle map, and source evidence. |
-| **Research memory** | Uses a local SQLite-backed object store so the product can act as an information-management library for research ideas and reasoning traces. |
-| **CLI + local web UI** | Run the web app locally or use CLI commands for ingestion, generation, principle search, graph output, and reset. |
+| ![Research goal and project workspace](docs/screenshots/main_goal.png) | ![Works tab with research records](docs/screenshots/main_works.png) |
 
-## Not Just an Idea Generator
-
-Principia also acts as a **research idea and thought-management library**.
-
-Instead of treating every session as a disposable LLM conversation, Principia keeps durable objects:
-
-- **Source Works**: papers, reports, and technical sources behind a project.
-- **Existed Ideas**: concise records of what prior works actually contributed.
-- **Principle Cards**: reusable mechanisms, assumptions, constraints, tradeoffs, invariants, failure modes, evidence spans, and confidence scores.
-- **Takeaway Messages**: nontrivial empirical lessons that can guide new work.
-- **Benchmarks, Baselines, and Results**: structured experimental context for fair comparison.
-- **My Ideas**: generated or user-authored idea records with versions, regeneration, editing, related-work comparison, principle maps, and source evidence.
-
-The long-term goal is a living **Principle Pool**: not a vector database of paper chunks, but a structured knowledge base of reusable research mechanisms.
-
-## The Principle-First Loop
-
-```mermaid
-flowchart LR
-    A[Research Goal or Idea Draft] --> B[Hybrid Corpus Builder]
-    B --> C[Structured Evidence Library]
-    C --> D[Principle Pool]
-    D --> E[Idea Operators]
-    E --> F[Traceable Idea Card]
-    F --> G[Validation Plan]
-    G --> H[Feedback and Run Notes]
-    H -. updates .-> D
-```
-
-Principia's idea operators are designed to make ideation inspectable rather than magical:
-
-| Operator | Question it asks |
+| Evidence composition | Generated idea |
 | --- | --- |
-| **Principle transfer** | Can a mechanism from another domain solve the same abstract pressure here? |
-| **Assumption inversion** | What happens if we deliberately violate a hidden assumption? |
-| **Contradiction resolution** | Can a known principle resolve a tension such as quality vs. cost or novelty vs. feasibility? |
-| **Mechanism composition** | Which compatible mechanisms become stronger together? |
-| **Failure-mode transplant** | What known failures in one domain should stress-test another? |
-| **Evaluator binding** | What is the cheapest falsification path before we over-invest? |
+| ![Compose from research evidence](docs/screenshots/add_evidence.png) | ![Generated idea overview](docs/screenshots/new_idea_intro.png) |
 
-## How Principia Is Different
+| Principia Calculus lineage | Principle map |
+| --- | --- |
+| ![Symbolic lineage graph](docs/screenshots/calculus_graph.png) | ![Principle map](docs/screenshots/principle_map.png) |
 
-| Compared with... | Typical focus | Principia's focus |
-| --- | --- | --- |
-| **Chatbot brainstorming** | Persuasive idea lists. | Structured Idea Cards with evidence, principle lineage, novelty contrast, validation path, and risks. |
-| **RAG-only ideation** | Retrieve papers, summarize, then brainstorm. | Convert papers into reusable principles before generating new ideas. |
-| **Survey/report tools** such as STORM or AutoSurvey | Knowledge curation and long-form reports. | Use literature synthesis as a launchpad for testable, principle-grounded hypotheses. |
-| **Idea-discovery agents** such as ResearchAgent or SciAgents | Agentic literature-based hypothesis generation. | Local editable research memory: principles, existed ideas, baselines, benchmarks, user notes, and generated ideas in one workspace. |
-| **AI Scientist-style systems** | End-to-end automation toward experiments and papers. | A human-in-the-loop principle, evidence, and validation layer; the north-star metric is idea survival, not automatic paper production. |
-| **Evaluator/code-search agents** such as AlphaEvolve-like systems | Search code or algorithm variants under evaluators. | Search the *idea space* first, then prepare validation artifacts for implementation. |
+| Principles | Related idea comparison |
+| --- | --- |
+| ![Principles tab](docs/screenshots/main_principles.png) | ![Related idea comparison](docs/screenshots/compare_ideas.png) |
 
-Principia is best understood as the missing connective layer between literature review, idea generation, experiment planning, and research memory.
+## What Principia Does
 
-## Quick Start
+Principia helps a researcher move from a broad goal to a traceable Idea Card:
 
-```bash
-git clone https://github.com/pzqpzq/Principia.git
-cd Principia
-python3 principia.py serve
-```
+1. Search and ingest relevant works.
+2. Extract high-quality existed ideas, principles, takeaway messages, benchmarks, and baselines from paper evidence.
+3. Store records in local SQLite with versioning, source links, evidence links, and full-text search.
+4. Select research materials into an evidence composer.
+5. Generate new ideas in standard mode or Principia Calculus mode.
+6. Inspect symbolic lineage, principle relationships, related idea comparisons, and source evidence.
+7. Export generated ideas as Markdown for external agents, experiments, method writing, or follow-up research.
 
-Open the local app:
+The system is designed around content quality and provenance. Failed online LLM calls are not silently replaced by templated filler.
 
-```text
-http://127.0.0.1:8790/
-```
+## Key v1.0 Features
 
-On first launch, Principia creates a local database:
+- Local-first SQLite product codebase.
+- Project sidebar with independent workspace scrolling.
+- Research workflow with cancellable LLM stages and partial persistence.
+- Works tab with show-more pagination and per-work extraction.
+- Normalized global memory layer:
+  `global_work`, `work_version`, `extraction_run`, `concept_card`, `concept_version`, `evidence_link`, `symbol_registry`, `derivation_run`, `derivation_node`, `derivation_edge`, `project_record_membership`, `run_event`, `embedding_index`, and `migration_status`.
+- Compatibility adapter for the older record buckets:
+  Source Works, Existed Ideas, Principles, Takeaway Messages, Benchmarks, Baselines, Results, and My Ideas.
+- Concept-level retrieval instead of retrieving a work and blindly showing all child records.
+- SQLite FTS5 search for works and concepts.
+- Optional embedding table with no mandatory vector dependency.
+- API key modal with masked status.
+- Detail pages, item editing, version selectors, refresh with LLM, and exports.
+- Standard idea generation and Principia Calculus generation.
+- Symbol table, verified derivation patches, speculative L0 nodes, lineage graph, principle map, and related-ideas comparison.
+- Markdown export for generated ideas.
+- Regression tests for schema, migration, extraction quality gates, cancellation, symbolic verification, no-template fallback, and UI-compatible routes.
+
+## Included Data
+
+This repository includes the current v1.0 local SQLite database at:
 
 ```text
 data/principia.sqlite
 ```
 
-Then create a project, paste a research goal or idea draft, choose an LLM, set a target work count, and click **Research**.
+It preserves the two current projects from the release workspace:
 
-## API Keys
+- `SciDia-MAS`
+- `LLM+logics`
 
-Principia ships without secrets. Add keys in the app through **API Keys**, or create `.env` manually:
+The database has been compacted with `VACUUM INTO` and checked with `PRAGMA integrity_check`. Runtime WAL/SHM files, logs, caches, PDFs, API keys, and private `.env` files are excluded.
 
-```bash
-cp .env.example .env
+## Repository Layout
+
+```text
+.
+├── principia/                  # v1 Python package
+├── static/                     # browser UI
+├── tests/                      # v1 regression tests
+├── data/
+│   ├── principia.sqlite        # included v1 demo/release database
+│   └── artifacts/              # local artifact folders, gitkept empty
+├── docs/screenshots/           # README screenshots
+├── legacy/v0-demo-jun8-v2/     # archived 0.x demo source
+├── principia.py                # CLI entrypoint
+├── requirements.txt
+└── principia_v1_design_proposal.md
 ```
 
-Then edit:
+The `legacy/v0-demo-jun8-v2/` folder keeps the old demo source for reference. It intentionally excludes old private databases and `.env` files.
+
+## Quick Start
+
+Principia v1.0 requires Python 3.9 or newer. Python 3.12 is recommended and was used for the release validation.
+
+```bash
+git clone https://github.com/pzqpzq/Principia.git
+cd Principia
+python3.12 -m pip install -r requirements.txt
+cp .env.example .env
+python3.12 principia.py serve --host 127.0.0.1 --port 8792
+```
+
+Open:
+
+```text
+http://127.0.0.1:8792/
+```
+
+The included database should show the two preserved projects immediately. If you want a clean local workspace instead, run:
+
+```bash
+python3.12 principia.py reset --yes
+```
+
+## LLM Configuration
+
+Principia works best with SiliconFlow models for day-to-day research and can optionally use OpenAI-compatible models. Put private keys only in `.env`, never in committed files:
 
 ```text
 SILICONFLOW_API_KEY=your_siliconflow_key_here
 OPENAI_API_KEY=your_openai_key_here
-```
-
-At least one callable LLM provider is required for LLM extraction and idea generation.
-
-Useful options:
-
-```text
+PRINCIPIA_LLM_BASE_URL=https://api.siliconflow.cn/v1
+PRINCIPIA_OPENAI_BASE_URL=https://api.openai.com/v1
 PRINCIPIA_REQUEST_TIMEOUT=180
-PRINCIPIA_COST_LIMIT_CNY=1000
-PRINCIPIA_SSL_VERIFY=1
+PRINCIPIA_SLOW_REQUEST_TIMEOUT=420
 ```
 
-Run on another port if needed:
-
-```bash
-python3 principia.py serve --host 127.0.0.1 --port 8791
-```
-
-## CLI Examples
-
-Mine principles from related works:
-
-```bash
-python3 principia.py ingest "long-context reasoning efficiency in LLM agents" --max-works 8
-```
-
-Generate traceable idea cards:
-
-```bash
-python3 principia.py generate "new idea for reliable and efficient LLM research agents" --ideas 4
-```
-
-Search the local principle pool:
-
-```bash
-python3 principia.py principles "adaptive compute routing under uncertainty" --top-k 8
-```
-
-Print a compact lineage graph:
-
-```bash
-python3 principia.py graph --query "agent memory and long-context reasoning"
-```
-
-Reset local data:
-
-```bash
-python3 principia.py reset --yes
-```
+Large models can require long timeouts. If an online LLM call fails, Principia surfaces the failure and preserves completed batches instead of inventing replacement content.
 
 ## Workflow
 
-1. **Create a project** for a research direction.
-2. **Enter a research goal or idea draft.**
-3. **Run Research** to collect and structure related field knowledge.
-4. **Inspect the evidence library**: Existed Ideas, Benchmarks, Baselines, Principles, and Takeaway Messages.
-5. **Generate Idea** from selected evidence and your own note.
-6. **Review the Idea Detail page**: novelty, mechanism, risks, validation protocol, related prior ideas, principle map, and source evidence.
-7. **Edit, regenerate, or preserve versions** as your research thinking evolves.
+### 1. Create or open a project
 
-## Architecture
+Each project stores its own goal, selected works, memberships, generated ideas, and run status. Multiple projects can be managed independently.
 
-```text
-Principia
-├── principia.py                 # CLI entry point
-├── principia_demo/
-│   ├── cli.py                   # ingest/generate/principles/graph/state/reset/serve
-│   ├── server.py                # local HTTP API and static file server
-│   ├── engine.py                # goal formalization, retrieval, curation, principle mining, idea generation
-│   ├── research_sources.py      # arXiv + OpenAlex + Crossref hybrid discovery
-│   ├── arxiv.py                 # arXiv search and fallback seed works
-│   ├── llm_client.py            # SiliconFlow/OpenAI-compatible LLM calls and cost guard
-│   ├── storage.py               # SQLite-backed local object store
-│   ├── models.py                # typed research objects
-│   ├── config.py                # local settings and environment handling
-│   └── utils.py                 # scoring, IDs, text utilities
-├── static/
-│   ├── index.html / app.js      # project workspace UI
-│   ├── idea.html / idea.js      # generated idea detail page
-│   ├── item.html / item.js      # record detail page
-│   └── styles.css               # local UI styling
-├── tests/                       # offline regression tests
-└── data/                        # local data directory; not for committed user data
-```
+### 2. Run Research
 
-### Core Objects
+Research retrieves relevant works, stores paper metadata, then extracts structured information from selected works:
 
-```text
-ResearchGoal
-  -> SourceWork
-  -> WorkFact
-  -> PrincipleCard
-  -> PrincipleRelation
-  -> IdeaCard
-  -> ResultEstimate
-  -> PromptPlan
-  -> FeedbackEvent
-```
+- Existed Ideas
+- Principles
+- Takeaway Messages
+- Benchmarks
+- Baselines
+- Result facts and evidence links
 
-These typed objects are the foundation for making research ideation traceable, editable, and reusable.
+Extraction is designed to prefer objective, complete, source-grounded arguments over author-voice quotes or loose summaries.
 
-## Local-First by Design
+### 3. Compose From Research Evidence
 
-Principia is intentionally local-first:
+Use the evidence composer to select works, ideas, principles, benchmarks, baselines, or takeaways. The selected evidence is project-scoped and can be inspected before generation.
 
-- Project data lives in `data/principia.sqlite`.
-- API keys are saved locally in `.env`.
-- The frontend is static HTML/CSS/JS served by a lightweight Python backend.
-- The demo does not ship with private project data.
-- Tests use fake or no-op LLM clients and do not spend API credits.
+### 4. Generate Ideas
 
-Do not commit or share:
+Two generation modes are available:
 
-```text
-.env
-data/*.sqlite
-data/*.sqlite-*
-__pycache__/
-*.pyc
-.DS_Store
-```
+- **Standard mode**: synthesizes a full Idea Card directly from selected evidence and the project goal.
+- **Principia Calculus mode**: builds symbols, derives compact structured patches, verifies references/support, stores lineage nodes and edges, then synthesizes a final Idea Card.
 
-## Quality and Research Integrity
+### 5. Inspect and Export
 
-Principia is designed to avoid misleading demo behavior:
+Generated idea pages include:
 
-- It should warn when an LLM provider cannot be called instead of silently falling back to fake generated content.
-- It keeps baseline and benchmark context visible so generated ideas can be compared fairly.
-- It treats generated ideas as hypotheses, not facts.
-- It favors provenance, editability, and validation over paper-mill automation.
-- It keeps the human in the loop for research judgment, interpretation, and dissemination.
+- Novelty claim
+- Mechanistic design
+- Method variants
+- Derived principles
+- Validation protocol
+- Relevant baselines and metrics
+- Source evidence
+- Related idea comparison
+- Principle map
+- Symbolic lineage graph
+- Markdown export
 
-## Roadmap
-
-Current local demo:
-
-- [x] Local project workspace
-- [x] SQLite-backed research object store
-- [x] Hybrid public metadata retrieval through arXiv, OpenAlex, and Crossref
-- [x] Existed Ideas, Principles, Takeaway Messages, Benchmarks, Baselines, and My Ideas tabs
-- [x] LLM-assisted extraction and idea generation
-- [x] Idea detail pages with versioning, editing, regeneration, related-work comparison, principle map, and source evidence
-- [x] CLI for ingestion, generation, principle search, graph output, serving, and reset
-- [x] Local API-key management through `.env`
-
-Near-term extensions:
-
-- [ ] Stronger Principle Card verification and evidence-span inspection
-- [ ] More explicit Idea Card exports: `IDEA_CARD.md`, `PRINCIPLE_TRACE.json`, and `VALIDATION_PLAN.md`
-- [ ] Codex-ready prompt plan export for repo orientation, experiment contract, baseline, candidate method, evaluation, ablations, result analysis, and feedback packaging
-- [ ] Calibrated result estimator with predicted vs. actual outcome tracking
-- [ ] Feedback ingestion from run logs, reviewer comments, user notes, and experiment metrics
-- [ ] MCP or assistant integration so other agents can call Principia as the principle and validation layer
-- [ ] Public or team-level Principle Graph with moderation and opt-in sharing
-
-## Why Star This Repo
-
-Star Principia if you care about any of these problems:
-
-- AI-assisted research should be **traceable**, not just fluent.
-- Literature review should become reusable **research memory**, not a one-off summary.
-- Idea generation should expose **principles, assumptions, baselines, metrics, and failure modes**.
-- Research agents should optimize for **ideas that survive implementation**, not just ideas that sound novel.
-- Local-first tools should let researchers keep unpublished ideas and private notes under their control.
-
-## Running Tests
-
-Install optional test dependencies:
+## CLI
 
 ```bash
-python3 -m pip install -r requirements.txt
+python3.12 principia.py serve --host 127.0.0.1 --port 8792
+python3.12 principia.py state --v1
+python3.12 principia.py research "efficient LLM research agents" --target-works 100
+python3.12 principia.py retrieve "adaptive compute routing" --types principle,takeaway_message
+python3.12 principia.py generate "new idea for agent memory" --mode principia-calculus
+python3.12 principia.py symbols --namespace default
+python3.12 principia.py lineage MI-...
+python3.12 principia.py export MI-...
+python3.12 principia.py migrate
+python3.12 principia.py reset --yes
 ```
 
-Run:
+Legacy-compatible commands remain available for old workflows:
 
 ```bash
-python3 -m unittest discover -s tests -p 'test*.py'
+python3.12 principia.py ingest "long-context reasoning efficiency"
+python3.12 principia.py principles "adaptive budget allocation"
+python3.12 principia.py graph --query "agent memory"
 ```
 
-## Contributing
+## API Surface
 
-Useful contribution areas include:
+Stable v1 endpoints include:
 
-- Better principle extraction and verification prompts.
-- Richer evidence-span UI.
-- Better graph visualization for principle lineage.
-- New source connectors for scholarly metadata.
-- Codex prompt-plan exporters.
-- Evaluation benchmarks comparing direct LLM ideation, RAG ideation, and principle-first ideation.
-- Documentation, screenshots, and example research projects.
+```text
+POST /api/v1/research/start
+GET  /api/v1/research/status
+POST /api/v1/research/cancel
+GET  /api/v1/projects
+GET  /api/v1/project/tab
+GET  /api/v1/item/detail
+POST /api/v1/item/update
+POST /api/v1/item/refresh/start
+POST /api/v1/retrieve-concepts
+POST /api/v1/ideas/standard-generate
+POST /api/v1/ideas/symbolic-generate
+GET  /api/v1/ideas/{idea_id}/lineage
+GET  /api/v1/symbols/table
+GET  /api/v1/symbols/expand
+POST /api/v1/feedback/ingest
+```
 
-## Related Systems and Positioning
+Temporary `/api/v2/*` aliases remain for compatibility while older detail and assembler flows are fully migrated.
 
-Principia is informed by work on literature-grounded ideation, graph-based scientific agents, automated survey generation, AI-scientist systems, and evaluator-guided code search. It is not trying to replace those systems. It is trying to provide the principle, evidence, and validation layer that connects them.
+## Quality and Safety Rules
 
-Representative systems worth reading:
+Principia v1.0 is strict about generated content:
 
-- [ResearchAgent](https://arxiv.org/abs/2404.07738): iterative research idea generation over scientific literature.
-- [SciAgents](https://arxiv.org/abs/2409.05556): multi-agent graph reasoning for scientific hypothesis generation.
-- [STORM](https://github.com/stanford-oval/storm): retrieval and multi-perspective question asking for grounded report generation.
-- [The AI Scientist](https://sakana.ai/ai-scientist/): end-to-end automated scientific discovery pipeline.
-- [AlphaEvolve](https://deepmind.google/discover/blog/alphaevolve-a-gemini-powered-coding-agent-for-designing-advanced-algorithms/): evaluator-guided algorithm discovery through evolutionary code search.
+- No silent template fallback for failed online LLM calls.
+- Offline/demo fallback content must be explicit and labeled.
+- Completed extraction batches are persisted before later-stage failures.
+- Cancellation is run-level: late responses are not saved after cancellation.
+- Benchmarks and baselines should be official and source-grounded, not invented.
+- Ideas, principles, and takeaways should be objective, complete, independent arguments rather than paper quotes or author-voice claims.
+- Full paper text can be used transiently for extraction, but full text is not retained in local storage.
 
-## Status
+## Tests
 
-Principia is an actively evolving research demo for local experimentation, product validation, and high-fidelity research-workflow prototyping. It is not yet a production multi-user deployment.
+```bash
+python3.12 -m unittest discover -s tests -v
+```
 
-## License
+Current local validation for this release:
 
-License is not specified yet. Add a `LICENSE` file before broad external redistribution.
+```text
+106 tests OK
+```
+
+The tests cover schema creation, migration, work identity and versioning, extraction cache behavior, quality gates, FTS search, symbol collision handling, derivation verification, symbolic generation, cancellation, related comparisons, markdown export, and no-template-fallback regressions.
+
+## Notes for Developers
+
+- Keep private data in `.env` and local-only artifact folders.
+- Do not commit WAL/SHM files, logs, cached PDFs, or API keys.
+- `data/principia.sqlite` is intentionally included for the v1.0 release snapshot.
+- Run tests before publishing changes.
+- Use the v1 API paths for new frontend work; keep `/api/v2/*` only for temporary compatibility.

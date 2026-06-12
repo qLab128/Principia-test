@@ -136,12 +136,44 @@ function renderItemBody(item, bucket) {
   if (bucket === "baseline_records") {
     return `
       <div class="idea-grid">
-        ${block("Method Summary", item.description || item.summary)}
-        ${block("Method Principle", item.principle)}
+        ${block("Core Idea", item.core_idea || item.description || item.summary)}
+        ${block("Methodology", item.methodology || item.principle)}
+        ${block("Discussion", item.discussion)}
         ${block("Baseline Type", item.baseline_type)}
         ${block("Benchmarks", item.benchmarks)}
       </div>
       ${performanceTable(item.performance)}
+      ${shared}
+    `;
+  }
+  if (bucket === "principles") {
+    return `
+      <div class="idea-grid">
+        ${block("Argument", item.argument || item.abstract_signature)}
+        ${block("Discussion", item.discussion)}
+        ${block("Boundary Conditions", item.boundary_conditions)}
+      </div>
+      ${shared}
+    `;
+  }
+  if (bucket === "existed_ideas") {
+    return `
+      <div class="idea-grid">
+        ${block("Core Idea", item.core_idea || item.idea_text || item.summary)}
+        ${block("Mechanism", item.mechanism)}
+        ${block("Discussion", item.discussion)}
+      </div>
+      ${shared}
+    `;
+  }
+  if (bucket === "takeaway_messages") {
+    return `
+      <div class="idea-grid">
+        ${block("Main Results", item.main_results || item.message_text)}
+        ${block("Condition", item.condition)}
+        ${block("Discussion", item.discussion)}
+        ${block("Actionable Lesson", item.actionable_lesson)}
+      </div>
       ${shared}
     `;
   }
@@ -201,12 +233,46 @@ function editSchemaFor(bucket) {
   if (bucket === "baseline_records") {
     return [
       { key: "baseline_name", label: "Baseline Method Name", type: "short" },
+      { key: "core_idea", label: "Core Idea", type: "long" },
+      { key: "methodology", label: "Methodology", type: "long" },
+      { key: "discussion", label: "Discussion", type: "long" },
       { key: "description", label: "Method Introduction", type: "long" },
       { key: "principle", label: "Method Principle", type: "long" },
       { key: "source_paper_link", label: "Source Paper Link", type: "short" },
       { key: "official_code_url", label: "Official Code Link", type: "short" },
       { key: "benchmarks", label: "Benchmarks, one per line", type: "array" },
       { key: "performance", label: "Performance rows as JSON array", type: "json" },
+    ];
+  }
+  if (bucket === "principles") {
+    return [
+      { key: "name", label: "Name", type: "short" },
+      { key: "argument", label: "Argument", type: "long" },
+      { key: "evidence", label: "Evidence", type: "long" },
+      { key: "discussion", label: "Discussion", type: "long" },
+      { key: "boundary_conditions", label: "Boundary Conditions, one per line", type: "array" },
+      { key: "source_paper_link", label: "Source Paper Link", type: "short" },
+    ];
+  }
+  if (bucket === "existed_ideas") {
+    return [
+      { key: "title", label: "Title", type: "short" },
+      { key: "core_idea", label: "Core Idea", type: "long" },
+      { key: "mechanism", label: "Mechanism", type: "long" },
+      { key: "discussion", label: "Discussion", type: "long" },
+      { key: "evidence", label: "Evidence", type: "long" },
+      { key: "source_paper_link", label: "Source Paper Link", type: "short" },
+    ];
+  }
+  if (bucket === "takeaway_messages") {
+    return [
+      { key: "title", label: "Title", type: "short" },
+      { key: "main_results", label: "Main Results", type: "long" },
+      { key: "condition", label: "Condition", type: "long" },
+      { key: "discussion", label: "Discussion", type: "long" },
+      { key: "evidence", label: "Evidence", type: "long" },
+      { key: "actionable_lesson", label: "Actionable Lesson", type: "long" },
+      { key: "source_paper_link", label: "Source Paper Link", type: "short" },
     ];
   }
   return [

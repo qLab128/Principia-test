@@ -5,6 +5,27 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Principia Idea</title>
     <link rel="stylesheet" href="/styles.css" />
+    <script>
+      window.MathJax = {
+        tex: {
+          inlineMath: [["$", "$"], ["\\(", "\\)"]],
+          displayMath: [["$$", "$$"], ["\\[", "\\]"]],
+          processEscapes: true,
+          macros: {
+            argmax: "\\operatorname*{arg\\,max}",
+            argmin: "\\operatorname*{arg\\,min}",
+            softmax: "\\operatorname{softmax}",
+            sigmoid: "\\operatorname{sigmoid}",
+            KL: "\\operatorname{KL}",
+            E: "\\mathbb{E}",
+            R: "\\mathbb{R}",
+            N: "\\mathbb{N}",
+          },
+        },
+        svg: { fontCache: "global", linebreaks: { automatic: true, width: "container" } },
+      };
+    </script>
+    <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
   </head>
   <body class="idea-page">
     <main class="idea-shell">
@@ -21,12 +42,14 @@
             <span>Target LLM</span>
             <select id="ideaModelMode">
               <option value="auto">Auto router</option>
-              <option value="efficient">Qwen2.5-7B</option>
+              <option value="qwen_27b">Qwen3.6-27B</option>
               <option value="qwen_35b">Qwen3.6-35B-A3B</option>
               <option value="strong">DeepSeek-V3</option>
               <option value="deepseek_pro">DeepSeek-V4-Pro</option>
+              <option value="deepseek_r1">DeepSeek-R1</option>
               <option value="kimi">Kimi-K2.6 Pro</option>
               <option value="qwen_122b">Qwen3.5-122B-A10B</option>
+              <option value="qwen_397b">Qwen3.5-397B-A17B</option>
               <option value="glm">GLM-5.1 Pro</option>
               <option value="openai_gpt52_pro">OpenAI GPT-5.2 Pro</option>
               <option value="openai_gpt5_pro">OpenAI GPT-5 Pro</option>
@@ -35,6 +58,7 @@
             </select>
           </label>
           <button id="editIdeaBtn" type="button" class="secondary-btn">Edit</button>
+          <button id="exportIdeaMarkdownBtn" type="button" class="secondary-btn">Export Markdown</button>
           <button id="regenerateIdeaBtn" type="button" class="primary-btn">Regenerate</button>
           <button id="cancelRegenerateBtn" type="button" class="secondary-btn danger-btn" data-allow-busy="true" hidden>Cancel</button>
           <button id="deleteIdeaBtn" type="button" class="secondary-btn danger-btn">Delete</button>
@@ -58,12 +82,25 @@
       </form>
       <section id="ideaCore" class="idea-grid"></section>
       <section class="idea-section">
-        <h2>Related Existed Ideas</h2>
+        <div class="section-heading-row">
+          <h2>Related Ideas Comparison</h2>
+          <div class="section-actions">
+            <button id="generateRelatedComparisonBtn" type="button" class="secondary-btn">Generate Comparison</button>
+            <button id="redesignFromComparisonBtn" type="button" class="secondary-btn">Redesign From Comparison</button>
+            <button id="cancelRedesignBtn" type="button" class="secondary-btn danger-btn" data-allow-busy="true" hidden>Cancel Redesign</button>
+            <button id="cancelRelatedComparisonBtn" type="button" class="secondary-btn danger-btn" data-allow-busy="true" hidden>Cancel</button>
+          </div>
+        </div>
+        <div id="relatedComparisonStatus" class="mini-status"></div>
         <div id="relatedTable"></div>
       </section>
       <section class="idea-section">
         <h2>Principle Map</h2>
         <div id="principleMap" class="principle-map"></div>
+      </section>
+      <section class="idea-section">
+        <h2>Symbolic Lineage</h2>
+        <div id="symbolicLineage" class="principle-map"></div>
       </section>
       <section class="idea-section">
         <h2>Source Evidence</h2>
