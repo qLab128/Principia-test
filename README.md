@@ -1,101 +1,200 @@
+<div align="center">
+
 # Principia v1.0
 
-Principia is a local-first research ideation system for building high-quality, evidence-grounded ideas from papers, benchmarks, baselines, principles, and generated symbolic derivations.
+**A local-first research intelligence system for evidence-grounded idea generation.**
 
-Version 1.0 upgrades the earlier Principia 0.x demo into a product-oriented codebase with normalized research memory, live research workflows, concept-level retrieval, traceable idea generation, and an MVP of **Principia Calculus**, a symbolic mode for deriving new ideas through verified lineage graphs instead of opaque one-shot text generation.
+Principia turns papers, benchmarks, baselines, principles, and symbolic derivations into traceable research ideas that can be inspected, challenged, exported, and improved.
 
-Business collaboration: [peizhengqi@chipflow.net](mailto:peizhengqi@chipflow.net)  
-Academic collaboration: [peizhengqi22@mails.ucas.ac.cn](mailto:peizhengqi22@mails.ucas.ac.cn)
+<p>
+  <img alt="Python 3.9+" src="https://img.shields.io/badge/Python-3.9%2B-111827?style=flat-square">
+  <img alt="SQLite local first" src="https://img.shields.io/badge/Storage-SQLite%20local--first-111827?style=flat-square">
+  <img alt="Principia Calculus" src="https://img.shields.io/badge/Mode-Principia%20Calculus-111827?style=flat-square">
+  <img alt="Release tests" src="https://img.shields.io/badge/Tests-106%20passing-111827?style=flat-square">
+</p>
 
-## Screenshots
+<p>
+  <a href="#overview">Overview</a> ·
+  <a href="#product-tour">Product Tour</a> ·
+  <a href="#principia-calculus">Principia Calculus</a> ·
+  <a href="#quick-start">Quick Start</a> ·
+  <a href="#architecture">Architecture</a> ·
+  <a href="#contact">Contact</a>
+</p>
 
-| Research workspace | Works library |
+</div>
+
+<p align="center">
+  <img src="docs/screenshots/main_goal.png" alt="Principia v1 research workspace" width="920">
+</p>
+
+## Overview
+
+Principia v1.0 is the first product-oriented release of Principia. It upgrades the earlier 0.x demo into a structured local research system with normalized memory, source-grounded extraction, concept-level retrieval, cancellable LLM workflows, and a symbolic generation mode called **Principia Calculus**.
+
+The core premise is simple: high-quality research ideas should not come from a single opaque prompt. They should emerge from a controlled pipeline that preserves source works, extracts reusable concepts, records evidence links, tracks versions, verifies symbolic derivations, and makes the final idea auditable.
+
+Principia is designed for researchers who need to move from a broad goal to a concrete, testable, paper-ready idea while keeping provenance visible at every step.
+
+## What Principia Helps You Do
+
+| Stage | What Principia provides |
 | --- | --- |
-| ![Research goal and project workspace](docs/screenshots/main_goal.png) | ![Works tab with research records](docs/screenshots/main_works.png) |
+| Research | Search and ingest relevant works, preserve metadata, and run per-work extraction. |
+| Extraction | Convert papers into existed ideas, principles, takeaways, benchmarks, baselines, and result facts. |
+| Memory | Store concepts in a normalized local SQLite schema with evidence links, version history, FTS search, and project memberships. |
+| Retrieval | Retrieve concepts independently by type instead of showing every child record from a matched paper. |
+| Composition | Select research evidence into a project-scoped evidence composer. |
+| Generation | Produce new Idea Cards through standard synthesis or symbolic Principia Calculus. |
+| Inspection | Review lineage graphs, principle maps, source works, related idea comparisons, and generated method details. |
+| Export | Export idea pages as Markdown for external agents, experiments, method writing, or paper development. |
 
-| Evidence composition | Generated idea |
+## Product Tour
+
+### Research workspace and source works
+
+Principia starts from a research goal, retrieves relevant works, and keeps the project workspace local, inspectable, and interruptible.
+
+| Research goal | Works library |
 | --- | --- |
-| ![Compose from research evidence](docs/screenshots/add_evidence.png) | ![Generated idea overview](docs/screenshots/new_idea_intro.png) |
+| <img src="docs/screenshots/main_goal.png" alt="Research goal and project workspace" width="520"> | <img src="docs/screenshots/main_works.png" alt="Works tab with source work records" width="520"> |
 
-| Principia Calculus lineage | Principle map |
+### Evidence composer and generated ideas
+
+Evidence can be selected from works, principles, existed ideas, benchmarks, baselines, and takeaways before generation. Generated ideas remain tied to their selected materials.
+
+| Compose from research evidence | Generated idea overview |
 | --- | --- |
-| ![Symbolic lineage graph](docs/screenshots/calculus_graph.png) | ![Principle map](docs/screenshots/principle_map.png) |
+| <img src="docs/screenshots/add_evidence.png" alt="Compose from research evidence" width="520"> | <img src="docs/screenshots/new_idea_intro.png" alt="Generated idea overview" width="520"> |
 
-| Principles | Related idea comparison |
+### Symbolic lineage and principle map
+
+Principia Calculus makes the reasoning process visible through lineage nodes, edges, symbol references, derived concepts, and principle relationships.
+
+| Symbolic lineage graph | Principle map |
 | --- | --- |
-| ![Principles tab](docs/screenshots/main_principles.png) | ![Related idea comparison](docs/screenshots/compare_ideas.png) |
+| <img src="docs/screenshots/calculus_graph.png" alt="Symbolic lineage graph" width="520"> | <img src="docs/screenshots/principle_map.png" alt="Principle map" width="520"> |
 
-## What Principia Does
+### Research concepts and related comparisons
 
-Principia helps a researcher move from a broad goal to a traceable Idea Card:
+Concept records are organized by type, while generated ideas can be compared against related prior ideas for novelty and redesign.
 
-1. Search and ingest relevant works.
-2. Extract high-quality existed ideas, principles, takeaway messages, benchmarks, and baselines from paper evidence.
-3. Store records in local SQLite with versioning, source links, evidence links, and full-text search.
-4. Select research materials into an evidence composer.
-5. Generate new ideas in standard mode or Principia Calculus mode.
-6. Inspect symbolic lineage, principle relationships, related idea comparisons, and source evidence.
-7. Export generated ideas as Markdown for external agents, experiments, method writing, or follow-up research.
+| Principles tab | Related idea comparison |
+| --- | --- |
+| <img src="docs/screenshots/main_principles.png" alt="Principles tab" width="520"> | <img src="docs/screenshots/compare_ideas.png" alt="Related idea comparison" width="520"> |
 
-The system is designed around content quality and provenance. Failed online LLM calls are not silently replaced by templated filler.
+## Core Capabilities
 
-## Key v1.0 Features
+### Local-first research memory
 
-- Local-first SQLite product codebase.
-- Project sidebar with independent workspace scrolling.
-- Research workflow with cancellable LLM stages and partial persistence.
-- Works tab with show-more pagination and per-work extraction.
-- Normalized global memory layer:
-  `global_work`, `work_version`, `extraction_run`, `concept_card`, `concept_version`, `evidence_link`, `symbol_registry`, `derivation_run`, `derivation_node`, `derivation_edge`, `project_record_membership`, `run_event`, `embedding_index`, and `migration_status`.
-- Compatibility adapter for the older record buckets:
-  Source Works, Existed Ideas, Principles, Takeaway Messages, Benchmarks, Baselines, Results, and My Ideas.
-- Concept-level retrieval instead of retrieving a work and blindly showing all child records.
-- SQLite FTS5 search for works and concepts.
-- Optional embedding table with no mandatory vector dependency.
-- API key modal with masked status.
-- Detail pages, item editing, version selectors, refresh with LLM, and exports.
-- Standard idea generation and Principia Calculus generation.
-- Symbol table, verified derivation patches, speculative L0 nodes, lineage graph, principle map, and related-ideas comparison.
-- Markdown export for generated ideas.
-- Regression tests for schema, migration, extraction quality gates, cancellation, symbolic verification, no-template fallback, and UI-compatible routes.
+Principia uses a local SQLite database as the default system of record. The v1 schema separates works, work versions, extraction runs, concept cards, concept versions, evidence links, symbols, derivation runs, derivation graphs, project memberships, and run events.
 
-## Included Data
+This allows the same paper-level extraction to be reused across projects while project-specific goals, selected evidence, generated ideas, and run states remain isolated.
 
-This repository includes the current v1.0 local SQLite database at:
+### High-quality information extraction
+
+Extraction is designed around objective, complete, source-grounded research concepts:
+
+- **Existed ideas**: general and inspiring technical ideas with mechanism, source works, and discussion.
+- **Principles**: fundamental arguments supported by evidence from source works.
+- **Takeaway messages**: reusable findings with conditions, interpretation, and engineering relevance.
+- **Benchmarks**: official or clearly named evaluation settings, tasks, datasets, and metrics.
+- **Baselines**: methods explicitly used as comparison systems in source works, with methodology and performance when available.
+- **Works**: title, abstract, authors, venue/date, links, identifiers, and extraction status.
+
+Online LLM failures are surfaced as failures. Principia does not silently replace failed LLM output with template-like filler.
+
+### Cancellable and partially persistent runs
+
+LLM-heavy stages are run-level operations. A user can terminate research or generation without losing completed batches. Late responses are not saved after cancellation, and completed extraction results remain available.
+
+### Concept-level retrieval
+
+Principia retrieves concepts by type. It does not simply retrieve a paper and display every child item under that paper. Returned concepts include source evidence, score components, version metadata, and retrieval rationale.
+
+### Idea pages for serious follow-up
+
+Generated Idea Cards include mechanistic design, method variants, derived principles, validation plans, relevant baselines, source evidence, related idea comparisons, principle maps, symbolic lineage, and Markdown export.
+
+## Principia Calculus
+
+Principia Calculus is the symbolic generation mode in v1.0. It is built for research ideation workflows where token-efficient reasoning, provenance, and recursive improvement matter.
+
+Instead of asking an LLM to write a final idea in one pass, Principia Calculus:
+
+1. Builds a symbol table over selected and retrieved evidence.
+2. Generates compact derivation patches.
+3. Verifies references, node types, support links, and derived-from relations.
+4. Stores speculative L0 nodes and higher-order derived nodes.
+5. Synthesizes a final Idea Card from verified derivation structure.
+6. Renders a lineage graph that can be inspected node by node.
+
+The result is not just a generated paragraph. It is a traceable derivation object with source evidence, concept links, and a visual reasoning path.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    Goal["Project goal"] --> Search["Work retrieval"]
+    Search --> Works["global_work and work_version"]
+    Works --> Extract["LLM extraction runs"]
+    Extract --> Concepts["concept_card and concept_version"]
+    Concepts --> Evidence["evidence_link"]
+    Concepts --> Retrieve["Hybrid concept retrieval"]
+    Evidence --> Compose["Evidence composer"]
+    Retrieve --> Compose
+    Compose --> Standard["Standard idea generation"]
+    Compose --> Calculus["Principia Calculus"]
+    Calculus --> Symbols["symbol_registry"]
+    Calculus --> Graph["derivation_node and derivation_edge"]
+    Standard --> Idea["Idea Card"]
+    Graph --> Idea
+    Idea --> Export["Markdown export"]
+```
+
+## Included Release Snapshot
+
+This repository includes the current v1.0 release database:
 
 ```text
 data/principia.sqlite
 ```
 
-It preserves the two current projects from the release workspace:
+The database preserves two projects from the release workspace:
 
 - `SciDia-MAS`
 - `LLM+logics`
 
-The database has been compacted with `VACUUM INTO` and checked with `PRAGMA integrity_check`. Runtime WAL/SHM files, logs, caches, PDFs, API keys, and private `.env` files are excluded.
+The database was compacted with `VACUUM INTO` and checked with `PRAGMA integrity_check`. Runtime WAL/SHM files, logs, cached PDFs, private `.env` files, and API keys are excluded.
+
+To start from an empty local workspace after cloning, run:
+
+```bash
+python3.12 principia.py reset --yes
+```
 
 ## Repository Layout
 
 ```text
 .
-├── principia/                  # v1 Python package
-├── static/                     # browser UI
+├── principia/                  # Principia v1 Python package
+├── static/                     # Browser UI
 ├── tests/                      # v1 regression tests
 ├── data/
-│   ├── principia.sqlite        # included v1 demo/release database
+│   ├── principia.sqlite        # included v1.0 release database
 │   └── artifacts/              # local artifact folders, gitkept empty
 ├── docs/screenshots/           # README screenshots
-├── legacy/v0-demo-jun8-v2/     # archived 0.x demo source
+├── legacy/v0-demo-jun8-v2/     # archived Principia 0.x demo source
 ├── principia.py                # CLI entrypoint
 ├── requirements.txt
 └── principia_v1_design_proposal.md
 ```
 
-The `legacy/v0-demo-jun8-v2/` folder keeps the old demo source for reference. It intentionally excludes old private databases and `.env` files.
+The `legacy/v0-demo-jun8-v2/` folder keeps the old demo source for reference. Private databases and `.env` files from the old demo are intentionally excluded.
 
 ## Quick Start
 
-Principia v1.0 requires Python 3.9 or newer. Python 3.12 is recommended and was used for the release validation.
+Principia v1.0 requires Python 3.9 or newer. Python 3.12 is recommended and was used for release validation.
 
 ```bash
 git clone https://github.com/pzqpzq/Principia.git
@@ -105,21 +204,15 @@ cp .env.example .env
 python3.12 principia.py serve --host 127.0.0.1 --port 8792
 ```
 
-Open:
+Open the local app:
 
 ```text
 http://127.0.0.1:8792/
 ```
 
-The included database should show the two preserved projects immediately. If you want a clean local workspace instead, run:
-
-```bash
-python3.12 principia.py reset --yes
-```
-
 ## LLM Configuration
 
-Principia works best with SiliconFlow models for day-to-day research and can optionally use OpenAI-compatible models. Put private keys only in `.env`, never in committed files:
+Principia supports SiliconFlow and OpenAI-compatible model endpoints. Put private keys only in `.env`.
 
 ```text
 SILICONFLOW_API_KEY=your_siliconflow_key_here
@@ -128,55 +221,11 @@ PRINCIPIA_LLM_BASE_URL=https://api.siliconflow.cn/v1
 PRINCIPIA_OPENAI_BASE_URL=https://api.openai.com/v1
 PRINCIPIA_REQUEST_TIMEOUT=180
 PRINCIPIA_SLOW_REQUEST_TIMEOUT=420
+PRINCIPIA_COST_LIMIT_CNY=1000
+PRINCIPIA_SSL_VERIFY=1
 ```
 
-Large models can require long timeouts. If an online LLM call fails, Principia surfaces the failure and preserves completed batches instead of inventing replacement content.
-
-## Workflow
-
-### 1. Create or open a project
-
-Each project stores its own goal, selected works, memberships, generated ideas, and run status. Multiple projects can be managed independently.
-
-### 2. Run Research
-
-Research retrieves relevant works, stores paper metadata, then extracts structured information from selected works:
-
-- Existed Ideas
-- Principles
-- Takeaway Messages
-- Benchmarks
-- Baselines
-- Result facts and evidence links
-
-Extraction is designed to prefer objective, complete, source-grounded arguments over author-voice quotes or loose summaries.
-
-### 3. Compose From Research Evidence
-
-Use the evidence composer to select works, ideas, principles, benchmarks, baselines, or takeaways. The selected evidence is project-scoped and can be inspected before generation.
-
-### 4. Generate Ideas
-
-Two generation modes are available:
-
-- **Standard mode**: synthesizes a full Idea Card directly from selected evidence and the project goal.
-- **Principia Calculus mode**: builds symbols, derives compact structured patches, verifies references/support, stores lineage nodes and edges, then synthesizes a final Idea Card.
-
-### 5. Inspect and Export
-
-Generated idea pages include:
-
-- Novelty claim
-- Mechanistic design
-- Method variants
-- Derived principles
-- Validation protocol
-- Relevant baselines and metrics
-- Source evidence
-- Related idea comparison
-- Principle map
-- Symbolic lineage graph
-- Markdown export
+Large research models can require longer request windows. If a provider times out or returns an invalid response, Principia preserves completed work and reports the failure rather than fabricating replacement content.
 
 ## CLI
 
@@ -193,7 +242,7 @@ python3.12 principia.py migrate
 python3.12 principia.py reset --yes
 ```
 
-Legacy-compatible commands remain available for old workflows:
+Legacy-compatible commands remain available for older workflows:
 
 ```bash
 python3.12 principia.py ingest "long-context reasoning efficiency"
@@ -203,7 +252,7 @@ python3.12 principia.py graph --query "agent memory"
 
 ## API Surface
 
-Stable v1 endpoints include:
+Stable v1 endpoints:
 
 ```text
 POST /api/v1/research/start
@@ -223,38 +272,73 @@ GET  /api/v1/symbols/expand
 POST /api/v1/feedback/ingest
 ```
 
-Temporary `/api/v2/*` aliases remain for compatibility while older detail and assembler flows are fully migrated.
+Temporary `/api/v2/*` aliases remain for compatibility while older UI flows are migrated.
+
+## Data Model
+
+Principia v1.0 uses a normalized global memory layer:
+
+```text
+global_work
+work_version
+extraction_run
+concept_card
+concept_version
+evidence_link
+symbol_registry
+derivation_run
+derivation_node
+derivation_edge
+project_record_membership
+run_event
+embedding_index
+migration_status
+```
+
+SQLite FTS5 indexes support full-text search over works and concepts. The optional embedding table gives the system a future-compatible hybrid retrieval structure without making vector dependencies mandatory.
 
 ## Quality and Safety Rules
 
-Principia v1.0 is strict about generated content:
+Principia v1.0 follows several strict rules:
 
-- No silent template fallback for failed online LLM calls.
+- Failed online LLM calls must not create template-style replacement ideas.
 - Offline/demo fallback content must be explicit and labeled.
-- Completed extraction batches are persisted before later-stage failures.
-- Cancellation is run-level: late responses are not saved after cancellation.
-- Benchmarks and baselines should be official and source-grounded, not invented.
-- Ideas, principles, and takeaways should be objective, complete, independent arguments rather than paper quotes or author-voice claims.
-- Full paper text can be used transiently for extraction, but full text is not retained in local storage.
+- Paper full text can be used transiently for extraction, but full text is not retained locally.
+- Benchmarks and baselines should be official, named, and source-grounded.
+- Ideas, principles, and takeaways should be objective, complete, independent arguments.
+- Project state, selected evidence, and run status should remain isolated across projects.
+- Cancellation preserves completed batches and blocks late writes from cancelled runs.
+
+These constraints are product requirements, not cosmetic preferences. They are central to making generated research content trustworthy enough for serious follow-up.
 
 ## Tests
+
+Run the regression suite:
 
 ```bash
 python3.12 -m unittest discover -s tests -v
 ```
 
-Current local validation for this release:
+Release validation:
 
 ```text
 106 tests OK
 ```
 
-The tests cover schema creation, migration, work identity and versioning, extraction cache behavior, quality gates, FTS search, symbol collision handling, derivation verification, symbolic generation, cancellation, related comparisons, markdown export, and no-template-fallback regressions.
+The test suite covers schema creation, migration, work identity resolution, work versioning, extraction cache behavior, quality gates, FTS search, symbol collision handling, derivation verification, symbolic generation, cancellation, related comparisons, Markdown export, and no-template-fallback regressions.
 
-## Notes for Developers
+## Development Notes
 
-- Keep private data in `.env` and local-only artifact folders.
-- Do not commit WAL/SHM files, logs, cached PDFs, or API keys.
-- `data/principia.sqlite` is intentionally included for the v1.0 release snapshot.
+- Keep secrets in `.env`; never commit API keys.
+- Do not commit WAL/SHM files, runtime logs, cached PDFs, or local temporary artifacts.
+- `data/principia.sqlite` is intentionally included as the v1.0 release snapshot.
+- Use `/api/v1/*` for new frontend work.
+- Keep `/api/v2/*` only as temporary compatibility coverage.
 - Run tests before publishing changes.
-- Use the v1 API paths for new frontend work; keep `/api/v2/*` only for temporary compatibility.
+
+## Contact
+
+For business collaboration, contact [peizhengqi@chipflow.net](mailto:peizhengqi@chipflow.net).
+
+For academic collaboration, contact [peizhengqi22@mails.ucas.ac.cn](mailto:peizhengqi22@mails.ucas.ac.cn).
+
