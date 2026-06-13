@@ -10,17 +10,18 @@
 
 <p align="center">
   <a href="https://github.com/pzqpzq/Principia"><img alt="Repository" src="https://img.shields.io/badge/GitHub-pzqpzq%2FPrincipia-181717?logo=github"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-v1.0-0f766e">
+  <img alt="Version" src="https://img.shields.io/badge/version-v1.1-0f766e">
   <img alt="Python" src="https://img.shields.io/badge/python-3.9%2B-blue">
   <img alt="Storage" src="https://img.shields.io/badge/storage-SQLite%20%2B%20FTS5-044a64">
   <img alt="Mode" src="https://img.shields.io/badge/mode-local--first-7c3aed">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-106%20passing-brightgreen">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-118%20passing-brightgreen">
 </p>
 
 <p align="center">
   <a href="#why-principia">Why</a> ·
   <a href="#product-tour">Product Tour</a> ·
   <a href="#core-capabilities">Capabilities</a> ·
+  <a href="#principia-cloud-library-v11">Cloud Library</a> ·
   <a href="#quick-start">Quick Start</a> ·
   <a href="#principia-calculus">Principia Calculus</a> ·
   <a href="#architecture">Architecture</a>
@@ -162,6 +163,36 @@ project_record_membership
 run_event
 embedding_index
 migration_status
+```
+
+### Principia Cloud Library V1.1
+
+V1.1 adds a GitHub-native cloud memory layer above the local V1.0 workspace. It is still local-first: the app keeps using SQLite for active work, but can resolve candidate papers against a versioned Cloud Library before spending LLM calls.
+
+The Cloud Library stores public metadata and extracted Principia records, not paper full text:
+
+- compressed immutable work/concept packs for GitHub Release assets;
+- sharded SQLite route indexes for DOI, arXiv, OpenAlex, Semantic Scholar, OpenReview, Crossref, and title-hash lookup;
+- search/facet indexes for title, abstract, authors, venue, year, source type, model key, and concept type;
+- per-work/per-LLM extraction versions with a max-three retention policy per model key;
+- contribution packs, admin operations, crawler plans, and release workflows.
+
+Cloud commands:
+
+```bash
+python3 principia.py cloud stats
+python3 principia.py cloud resolve --input candidates.json --model-key provider:model:auto:prompt:schema:work_concepts
+python3 principia.py cloud export-snapshot --out dist/cloud
+python3 principia.py cloud upload --prepare --mode normal
+python3 principia.py cloud upload data/artifacts/cloud/contributions/CONTRIB_x.json
+python3 principia.py cloud compact --input cloud/contributions --out dist/cloud
+python3 principia.py cloud crawl --venues ICLR,NeurIPS --years 2024-2026 --max-papers 100
+```
+
+Open the local Cloud Library UI at:
+
+```text
+http://127.0.0.1:8792/cloud
 ```
 
 This design lets Principia separate:
