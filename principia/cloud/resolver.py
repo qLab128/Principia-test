@@ -71,6 +71,29 @@ class CloudResolver:
             results.append(result)
         return results
 
+    def fetch_work_bundle_by_id(self, work_id: str, manifest: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        work_id = str(work_id or "").strip()
+        if not work_id:
+            return None
+        manifest = manifest or self.manifest_client.load_manifest()
+        snapshot_id = str(manifest.get("snapshot_id") or "")
+        if not snapshot_id:
+            return None
+        for asset in manifest.get("assets") or []:
+            if asset.get("kind") != "route_index" or asset.get("route_type") != "work":
+                continue
+            try:
+                path = self.cache.unpack_sqlite_asset(asset, snapshot_id=snapshot_id)
+                row = self._lookup_route_by_work_id(path, work_id)
+            except Exception:
+                row = None
+            if not row:
+                continue
+            route = dict(row)
+            route["latest_by_model"] = self._loads(route.pop("latest_by_model_json", "{}"))
+            return self._fetch_payload(manifest, route, record_id=work_id)
+        return None
+
     def _resolve_one(
         self,
         candidate: dict[str, Any],
@@ -92,13 +115,14 @@ class CloudResolver:
                 continue
             route = dict(row)
             route["latest_by_model"] = self._loads(route.pop("latest_by_model_json", "{}"))
-            decision = cloud_freshness_decision(candidate, {"source_state": route, "latest_by_model": route.get("latest_by_model")}, model_key)
+            effective_model_key = self._effective_model_key(model_key, route.get("latest_by_model") or {})
+            decision = cloud_freshness_decision(candidate, {"source_state": route, "latest_by_model": route.get("latest_by_model")}, effective_model_key)
             should_extract = bool(decision.get("should_extract"))
             payload = None
             if not should_extract:
                 payload = self._fetch_payload(manifest, route, record_id=route["work_id"])
                 if hydrate and payload:
-                    self.hydrator.hydrate_work_bundle(payload, snapshot_id=manifest.get("snapshot_id", ""), model_key=model_key, project_id=project_id)
+                    self.hydrator.hydrate_work_bundle(payload, snapshot_id=manifest.get("snapshot_id", ""), model_key=effective_model_key, project_id=project_id)
             result = {
                 "candidate_work_id": candidate.get("work_id") or "",
                 "work_id": route["work_id"],
@@ -107,13 +131,15 @@ class CloudResolver:
                 "cloud_record": payload if payload and not should_extract else None,
                 "route": route,
                 "hydrated": bool(payload and hydrate and not should_extract),
+                "requested_model_key": model_key,
+                "model_key": effective_model_key,
             }
             self.cache.log_resolution(
-                cache_key=sha256_hex(str(keys) + model_key),
+                cache_key=sha256_hex(str(keys) + effective_model_key),
                 snapshot_id=str(manifest.get("snapshot_id") or ""),
                 work_id=route["work_id"],
                 resolution=result,
-                model_key=model_key,
+                model_key=effective_model_key,
                 source_state_hash=work_content_signature(candidate).get("content_hash", ""),
                 decision=result["decision"],
             )
@@ -133,6 +159,43 @@ class CloudResolver:
         with sqlite3.connect(sqlite_path) as conn:
             conn.row_factory = sqlite3.Row
             return conn.execute(f"SELECT * FROM cloud_work_route WHERE {' OR '.join(clauses)} LIMIT 1", params).fetchone()
+
+    def _lookup_route_by_work_id(self, sqlite_path: Path, work_id: str) -> sqlite3.Row | None:
+        with sqlite3.connect(sqlite_path) as conn:
+            conn.row_factory = sqlite3.Row
+            return conn.execute("SELECT * FROM cloud_work_route WHERE work_id = ? LIMIT 1", (work_id,)).fetchone()
+
+    def _effective_model_key(self, requested_model_key: str, latest_by_model: dict[str, Any]) -> str:
+        requested_model_key = str(requested_model_key or "")
+        if requested_model_key and ":auto:" not in requested_model_key:
+            return requested_model_key
+        keys = [str(key) for key in (latest_by_model or {}).keys() if key]
+        if not keys:
+            return requested_model_key
+        return sorted(keys, key=self._model_strength_rank, reverse=True)[0]
+
+    def _model_strength_rank(self, model_key: str) -> int:
+        mode = str(model_key or "").split(":")[2] if len(str(model_key or "").split(":")) > 2 else ""
+        order = [
+            "openai_gpt55_pro_20260423",
+            "openai_gpt55",
+            "openai_gpt52_pro",
+            "openai_gpt5_pro",
+            "qwen_397b",
+            "glm",
+            "deepseek_pro",
+            "deepseek_r1",
+            "kimi",
+            "qwen_122b",
+            "strong",
+            "qwen_35b",
+            "qwen_27b",
+            "auto",
+        ]
+        try:
+            return len(order) - order.index(mode)
+        except ValueError:
+            return 0
 
     def _fetch_payload(self, manifest: dict[str, Any], route: dict[str, Any], *, record_id: str) -> dict[str, Any] | None:
         asset = asset_by_id(manifest, route.get("pack_id") or "")

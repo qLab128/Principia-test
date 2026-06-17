@@ -4,13 +4,15 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Principia Idea</title>
-    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/styles.css?v=idea-graph-labels-1" />
     <script>
       window.MathJax = {
+        loader: { load: ["[tex]/noerrors"] },
         tex: {
           inlineMath: [["$", "$"], ["\\(", "\\)"]],
           displayMath: [["$$", "$$"], ["\\[", "\\]"]],
           processEscapes: true,
+          packages: { "[+]": ["noerrors"] },
           macros: {
             argmax: "\\operatorname*{arg\\,max}",
             argmin: "\\operatorname*{arg\\,min}",
@@ -22,7 +24,7 @@
             N: "\\mathbb{N}",
           },
         },
-        svg: { fontCache: "global", linebreaks: { automatic: true, width: "container" } },
+        svg: { fontCache: "global" },
       };
     </script>
     <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
@@ -124,6 +126,6 @@
       </article>
     </section>
 
-    <script src="/idea.js"></script>
+    <script src="/idea.js?v=idea-graph-labels-1"></script>
   </body>
 </html>

@@ -132,12 +132,48 @@ ZH_QUERY_EXPANSIONS: list[tuple[tuple[str, ...], tuple[str, ...]]] = [
         ),
     ),
     (
-        ("test time training", "test-time training", "test time adaptation", "test-time adaptation", "ttt", "测试时训练", "测试时适应"),
+        (
+            "test time training",
+            "test-time training",
+            "test time adaptation",
+            "test-time adaptation",
+            "ttt",
+            "测试时训练",
+            "测试时适应",
+        ),
         (
             "test-time training",
             "test-time adaptation",
             "online adaptation",
             "transductive inference",
+        ),
+    ),
+    (
+        (
+            "test time scaling",
+            "test-time scaling",
+            "inference time scaling",
+            "inference-time scaling",
+            "test time compute",
+            "test-time compute",
+            "inference compute",
+        ),
+        (
+            "test-time scaling",
+            "test-time compute",
+            "inference-time scaling",
+            "inference-time compute",
+            "inference compute scaling",
+        ),
+    ),
+    (
+        ("agent", "agents", "multi-agent", "multi agent", "agent society", "agentic", "llm agent"),
+        (
+            "multi-agent systems",
+            "LLM agents",
+            "agent communication",
+            "agent collaboration",
+            "agent planning",
         ),
     ),
     (

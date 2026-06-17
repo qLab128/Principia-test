@@ -114,22 +114,28 @@ class SymbolicIdeator:
             return self.llm.chat_json(
                 "You are Principia Calculus. Return only compact verified JSON derivation patches.",
                 (
-                    "Create a symbolic derivation patch with keys new_nodes, new_edges, candidate_ideas. "
+                    "Create a symbolic derivation patch with keys reasoning_plan, new_nodes, new_edges, candidate_ideas. "
                     "Each new_nodes item must use node_type, not type. Use supplied symbols as primary support, and later derived nodes may cite earlier derived nodes as support for higher-order reasoning. New speculative nodes must be L0 and "
                     "validation_status speculative_unverified. Expressions must use compose, stress_test, "
-                    "contrast, or specialize. Each candidate idea must include derived_from referencing at least one new node symbol. "
-                    "Use a multi-step derivation when enough evidence exists: at least one first-order node from source symbols, one second-order node that uses an earlier derived node plus new evidence, and one final synthesis node. "
-                    "Add speculation_depth to each node where source-only nodes are depth 1 and nodes depending on prior derived nodes have higher depth. "
+                    "contrast, specialize, branch, critique, prune, revise, merge, select, or feedback_loop. Each candidate idea must include derived_from referencing at least one new node symbol. "
+                    "Use adaptive-order calculus, not a fixed L1->L2->L3->L4->L5 ladder. First write reasoning_plan.target_depth and reasoning_plan.depth_rationale from the goal, evidence diversity, conflicts, and uncertainty; allowed depth is 1-10, but finish at L1-L3 when that is enough. Use L4-L10 only when a surviving branch genuinely needs additional abstraction, critique, or synthesis. "
+                    "Explore 2-4 competing reasoning branches when evidence supports multiple plausible paths. New nodes should include branch_id and branch_status kept|revised|pruned|merged|final_support. Prune weak branches explicitly through critique or pruning_decision nodes instead of forcing every branch into the final idea. "
+                    "Add speculation_depth to each node where source evidence is L0, first derived nodes are usually L1, and nodes depending on prior derived nodes may have higher depth. Do not create every integer depth just to look systematic; skip depths or stop early when justified. No node may exceed depth 10. "
+                    "Use self_feedback and critique fields on derived nodes to explain why a branch is kept, revised, or rejected. It is acceptable to change direction mid-derivation when a critique exposes weak novelty, weak grounding, or poor validation feasibility. "
+                    "If there are 3 or more derived nodes, include at least one explicit critique/self_feedback/pruning node or a candidate_ideas.reasoning_trace explaining why branching was unnecessary. "
+                    "The final candidate idea should cite only the strongest surviving derived node(s), not every intermediate step. "
                     "Do not create multiple derived nodes with the same summary, expression, or support set. Each derived node must represent a distinct reasoning operation. "
                     "Each derived node summary must be 2-3 concrete sentences explaining what is inferred, how the support symbols combine or conflict, and why this step matters. "
                     "Every selected source symbol that actually contributes must appear in at least one edge; omit unused symbols instead of pretending they contributed. "
                     "Each candidate idea must be presentation-ready, not a placeholder: include title, one_sentence_thesis, novelty_claim, "
                     "mechanistic_design(list), method_variants(list), why_it_might_work(list), validation_protocol(list), relevant_baselines(list), "
                     "metrics(list), risks(list), derived_principles(list), and cheapest_falsification. "
-                    "mechanistic_design must include variables/data structures, an algorithmic loop, a scoring or update rule, and variable definitions; write formulas in paper-ready LaTeX using $...$ or $$...$$. method_variants must include 2-4 concrete alternatives or ablations. "
+                    "mechanistic_design must read like a concise methodology section: include variables/data structures, an algorithmic loop, a scoring or update rule only when it is technically necessary, and variable definitions; write formulas in paper-ready LaTeX using $...$ or $$...$$. Do not describe derivation graph nodes, do not start items with 'this node', and do not use lineage-node summaries as the method. "
+                    "Selected symbols are inspiration and constraints, not prose to copy. The final candidate must introduce at least one new mechanism, representation, objective, or inference-time control loop that is not already present in the supplied symbols. Remove copied method names except as explicit prior-work citations. Replace decorative or undefined formulas with precise algorithmic prose. method_variants must include 2-4 concrete alternatives or ablations. "
+                    "Each candidate idea must include reasoning_trace as 3-6 concise bullets covering branch exploration, critique/pruning, self-feedback, and why the final branch survived. "
                     "derived_principles and relevant_baselines must include symbol plus full argument/method text, not bare symbols. "
                     "Do not invent performance numbers, percentages, or ranges unless they appear verbatim in the supplied symbols. "
-                    "Keep the derivation compact, but make the final idea card concrete, evidence-specific, and non-template.\n\n"
+                    "Keep the derivation as compact as the evidence permits, but make the final idea card concrete, evidence-specific, and non-template.\n\n"
                     f"Query: {query}\nUser note: {user_note}\nSymbols: {json.dumps(compact_symbols, ensure_ascii=False)}"
                 ),
                 complexity=0.84,
@@ -205,6 +211,11 @@ class SymbolicIdeator:
             "constraint",
             "failure_mode",
             "idea_seed",
+            "branch",
+            "critique",
+            "pruning_decision",
+            "self_feedback",
+            "synthesis",
             "final_idea",
         }
         allowed_operators = {
@@ -218,6 +229,13 @@ class SymbolicIdeator:
             "mechanism_composition",
             "failure_mode_transplant",
             "evaluator_binding",
+            "branch",
+            "critique",
+            "prune",
+            "revise",
+            "merge",
+            "select",
+            "feedback_loop",
         }
         raw_nodes = patch.get("new_nodes") if isinstance(patch.get("new_nodes"), list) else []
         support_default = list(symbol_table)[:2]
@@ -248,6 +266,7 @@ class SymbolicIdeator:
                 520,
             )
             summary = self._enrich_node_summary(summary, expression, supports, symbol_table)
+            summary = self._append_reasoning_annotations(summary, raw)
             signature = self._node_signature(summary, expression, supports)
             if signature in used_node_signatures:
                 support_gloss = "; ".join(
@@ -269,8 +288,13 @@ class SymbolicIdeator:
                     "summary": summary,
                     "support_symbols": supports,
                     "risk_symbols": risks,
+                    "branch_id": compact_text(str(raw.get("branch_id") or raw.get("branch") or ""), 80),
+                    "branch_status": compact_text(str(raw.get("branch_status") or raw.get("status") or ""), 80),
+                    "critique": compact_text(str(raw.get("critique") or ""), 520),
+                    "self_feedback": compact_text(str(raw.get("self_feedback") or raw.get("feedback") or ""), 520),
+                    "pruning_rationale": compact_text(str(raw.get("pruning_rationale") or raw.get("prune_reason") or ""), 520),
                     "validation_status": "speculative_unverified",
-                    "speculation_depth": raw.get("speculation_depth") or 0,
+                    "speculation_depth": self._normalize_depth(raw.get("speculation_depth") or 0),
                     "confidence": float(raw.get("confidence", 0.42) or 0.42),
                     "cheapest_falsification": raw.get("cheapest_falsification") or raw.get("falsification_path") or "",
                 }
@@ -286,6 +310,11 @@ class SymbolicIdeator:
                     "summary": self._enrich_node_summary(compact_text(user_note or query, 520) or "Speculative symbolic composition from selected evidence.", f"compose({', '.join(supports)})" if supports else "compose()", supports, symbol_table),
                     "support_symbols": supports,
                     "risk_symbols": [],
+                    "branch_id": "fallback",
+                    "branch_status": "kept",
+                    "critique": "",
+                    "self_feedback": "Fallback derivation used the selected evidence directly because the LLM did not return a valid branch structure.",
+                    "pruning_rationale": "",
                     "validation_status": "speculative_unverified",
                     "confidence": 0.38,
                     "cheapest_falsification": "",
@@ -355,6 +384,8 @@ class SymbolicIdeator:
                     "why_it_might_work": self._normalize_text_list(raw.get("why_it_might_work") or raw.get("rationale") or raw.get("expected_mechanism")),
                     "validation_protocol": self._normalize_text_list(raw.get("validation_protocol") or raw.get("validation") or raw.get("falsification_path") or raw.get("cheapest_falsification")),
                     "relevant_baselines": self._expand_symbol_list_items(self._normalize_text_list(raw.get("relevant_baselines") or raw.get("baselines")), symbol_table),
+                    "reasoning_trace": self._normalize_text_list(raw.get("reasoning_trace") or raw.get("branching_summary") or raw.get("self_feedback") or raw.get("critique_summary"), limit=700),
+                    "selected_branch_ids": self._normalize_text_list(raw.get("selected_branch_ids") or raw.get("surviving_branches") or raw.get("selected_branches"), limit=120),
                     "metrics": self._normalize_text_list(raw.get("metrics") or raw.get("success_metrics")),
                     "risks": self._normalize_text_list(raw.get("risks") or raw.get("failure_modes")),
                     "derived_principles": self._expand_symbol_list_items(self._normalize_text_list(raw.get("derived_principles") or raw.get("principles")), symbol_table),
@@ -362,6 +393,31 @@ class SymbolicIdeator:
                 }
             )
         return {**patch, "new_nodes": normalized_nodes, "new_edges": normalized_edges, "candidate_ideas": normalized_ideas}
+
+    def _append_reasoning_annotations(self, summary: str, raw: dict[str, Any]) -> str:
+        annotations: list[str] = []
+        branch_id = compact_text(str(raw.get("branch_id") or raw.get("branch") or ""), 80)
+        branch_status = compact_text(str(raw.get("branch_status") or raw.get("status") or ""), 80)
+        critique = compact_text(str(raw.get("critique") or ""), 360)
+        feedback = compact_text(str(raw.get("self_feedback") or raw.get("feedback") or ""), 360)
+        pruning = compact_text(str(raw.get("pruning_rationale") or raw.get("prune_reason") or ""), 360)
+        if branch_id or branch_status:
+            annotations.append(f"Branch: {branch_id or 'unnamed'}" + (f" ({branch_status})." if branch_status else "."))
+        if critique:
+            annotations.append(f"Critique: {critique}")
+        if feedback:
+            annotations.append(f"Self-feedback: {feedback}")
+        if pruning:
+            annotations.append(f"Pruning rationale: {pruning}")
+        if not annotations:
+            return summary
+        return compact_text(f"{summary.rstrip()} {' '.join(annotations)}", 1100)
+
+    def _normalize_depth(self, value: Any) -> int:
+        try:
+            return max(0, min(int(value or 0), 10))
+        except Exception:
+            return 0
 
     def _enrich_node_summary(self, summary: str, expression: str, supports: list[str], symbol_table: dict[str, dict[str, Any]]) -> str:
         text = compact_text(str(summary or "").strip(), 520)
@@ -489,15 +545,20 @@ class SymbolicIdeator:
         depth_by_symbol: dict[str, int] = {symbol: 0 for symbol in symbol_table}
         for raw_node in patch.get("new_nodes", []) or []:
             support_symbols = raw_node.get("support_symbols") or []
-            raw_depth = int(raw_node.get("speculation_depth") or 0)
+            raw_depth = self._normalize_depth(raw_node.get("speculation_depth") or 0)
             computed_depth = 1 + max([depth_by_symbol.get(str(symbol), 0) for symbol in support_symbols] or [0])
-            speculation_depth = max(raw_depth, computed_depth)
+            speculation_depth = max(1, min(max(raw_depth, computed_depth), 10))
             payload = {
                 "title": raw_node.get("symbol"),
                 "summary": raw_node.get("summary") or "",
                 "expression": raw_node.get("expression") or "",
                 "support_symbols": support_symbols,
                 "risk_symbols": raw_node.get("risk_symbols") or [],
+                "branch_id": raw_node.get("branch_id") or "",
+                "branch_status": raw_node.get("branch_status") or "",
+                "critique": raw_node.get("critique") or "",
+                "self_feedback": raw_node.get("self_feedback") or "",
+                "pruning_rationale": raw_node.get("pruning_rationale") or "",
                 "cheapest_falsification": raw_node.get("cheapest_falsification") or "",
                 "confidence_score": raw_node.get("confidence", 0.4),
                 "speculation_depth": speculation_depth,
@@ -570,6 +631,8 @@ class SymbolicIdeator:
             "why_it_might_work": raw.get("why_it_might_work") or [],
             "validation_protocol": raw.get("validation_protocol") or [],
             "relevant_baselines": raw.get("relevant_baselines") or [],
+            "reasoning_trace": raw.get("reasoning_trace") or [],
+            "selected_branch_ids": raw.get("selected_branch_ids") or [],
             "metrics": raw.get("metrics") or [],
             "risks": raw.get("risks") or [],
             "derived_principles": raw.get("derived_principles") or [],

@@ -136,7 +136,13 @@ def compact_contributions(input_dir: Path, out_dir: Path) -> dict[str, Any]:
             }
         )
     _apply_admin_operations(work_records, concepts_by_id, versions_by_work, extractions_by_work, evidence_by_work, admin_operations)
-    concept_records = _dedupe_concepts(list(concepts_by_id.values()))
+    concept_records, concept_id_map = _dedupe_concepts_with_aliases(list(concepts_by_id.values()))
+    if concept_id_map:
+        for rows in evidence_by_work.values():
+            for row in rows:
+                concept_id = str(row.get("concept_id") or "")
+                if concept_id in concept_id_map:
+                    row["concept_id"] = concept_id_map[concept_id]
     concept_by_id = {str(record.get("concept_id") or ""): record for record in concept_records}
     work_bundles = []
     for work_id, record in sorted(work_records.items()):
@@ -247,8 +253,17 @@ def _merge_public_concept(existing: dict[str, Any] | None, incoming: dict[str, A
     if not existing:
         return dict(incoming)
     merged = dict(existing)
-    support = dict(merged.get("support") or {})
+    incoming_ts = str((incoming.get("timestamps") or {}).get("updated_at") or incoming.get("updated_at") or "")
+    existing_ts = str((merged.get("timestamps") or {}).get("updated_at") or merged.get("updated_at") or "")
     incoming_support = incoming.get("support") or {}
+    existing_support = merged.get("support") or {}
+    incoming_conf = float(incoming_support.get("confidence_score") or incoming.get("confidence_score") or 0.0)
+    existing_conf = float(existing_support.get("confidence_score") or merged.get("confidence_score") or 0.0)
+    if incoming_ts > existing_ts or incoming_conf > existing_conf:
+        for key in ("canonical_label", "payload", "versioning", "timestamps", "aliases"):
+            if incoming.get(key):
+                merged[key] = incoming.get(key)
+    support = dict(merged.get("support") or {})
     support["supporting_work_ids"] = sorted(
         {
             *[str(item) for item in support.get("supporting_work_ids") or []],
@@ -330,24 +345,27 @@ def _public_work_bundle_record(
 
 
 def _dedupe_concepts(concepts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return _dedupe_concepts_with_aliases(concepts)[0]
+
+
+def _dedupe_concepts_with_aliases(concepts: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, str]]:
     by_key: dict[str, dict[str, Any]] = {}
+    id_map: dict[str, str] = {}
     for concept in concepts:
         key = f"{concept.get('concept_type') or ''}:{concept.get('canonical_key') or concept.get('concept_id') or ''}"
         if key not in by_key:
             by_key[key] = concept
+            concept_id = str(concept.get("concept_id") or "")
+            if concept_id:
+                id_map[concept_id] = concept_id
             continue
         existing = by_key[key]
-        existing_support = existing.setdefault("support", {})
-        support = concept.get("support") or {}
-        existing_support["supporting_work_ids"] = sorted(
-            {
-                *[str(item) for item in existing_support.get("supporting_work_ids") or []],
-                *[str(item) for item in support.get("supporting_work_ids") or []],
-            }
-        )
-        existing_support["evidence_count"] = max(int(existing_support.get("evidence_count") or 0), int(support.get("evidence_count") or 0))
-        existing_support["confidence_score"] = max(float(existing_support.get("confidence_score") or 0.5), float(support.get("confidence_score") or 0.5))
-    return list(by_key.values())
+        by_key[key] = _merge_public_concept(existing, concept)
+        kept_id = str(by_key[key].get("concept_id") or existing.get("concept_id") or "")
+        duplicate_id = str(concept.get("concept_id") or "")
+        if duplicate_id and kept_id:
+            id_map[duplicate_id] = kept_id
+    return list(by_key.values()), id_map
 
 
 def _reference_concepts(bundle: dict[str, Any], concept_entries: dict[str, PackEntry]) -> dict[str, Any]:

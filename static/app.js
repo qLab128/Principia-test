@@ -17,6 +17,7 @@ const state = {
   items: [],
   offset: 0,
   limit: 10,
+  total: 0,
   hasMore: false,
   busy: false,
   researchActive: false,
@@ -40,6 +41,9 @@ const state = {
   projectModal: { mode: "create", fieldId: "" },
   deleteProject: { fieldId: "" },
   toastTimer: null,
+  systemMode: localStorage.getItem("principia.systemMode") || "user",
+  adminConfigured: false,
+  adminAuthenticated: false,
 };
 
 const el = (id) => document.getElementById(id);
@@ -99,8 +103,36 @@ function typesetMath(root = document.body) {
   renderMathFallback(root);
 }
 
+function normalizeLatexFormula(value) {
+  let text = String(value ?? "")
+    .replace(/\\?\u0008ar/g, "\\bar")
+    .replace(/\\?\u0008ullet/g, "\\bullet")
+    .replace(/\\?\u0008eta/g, "\\beta")
+    .replace(/\\\\(?=[A-Za-z])/g, "\\")
+    .replace(/\.\.\./g, "\\ldots")
+    .trim();
+  text = text
+    .replace(/(^|[^\\])\bext\{/g, "$1\\text{")
+    .replace(/(^|[^\\])\brac\{/g, "$1\\frac{")
+    .replace(/(^|[^\\])\bmathbb\{/g, "$1\\mathbb{")
+    .replace(/(^|[^\\])\beal(_\{[^{}]+\})?/g, (_, prefix, subscript = "") => `${prefix}\\mathbb{R}${subscript}`)
+    .replace(/(^|[^\\])\bullet(?=\b|[{])/g, "$1\\bullet")
+    .replace(/(^|[^\\])\bar(?=\b|[{])/g, "$1\\bar")
+    .replace(/\\ullet\b/g, "\\bullet")
+    .replace(/\\ar\{([^{}]+)\}/g, "\\bar{$1}")
+    .replace(/\\ar([A-Za-z])\b/g, "\\bar{$1}")
+    .replace(/(^|[^\\])\bheta(?=\b|[_^])/g, "$1\\theta")
+    .replace(/(^|[^\\])\babla(?=\b|[_^])/g, "$1\\nabla")
+    .replace(/(^|[^\\])\bau(?=\b|[_^])/g, "$1\\tau")
+    .replace(/(^|[^\\])\bho(?=\b|[_^])/g, "$1\\rho")
+    .replace(/\\\s+(\\[A-Za-z])/g, "$1")
+    .replace(/(\\text\{[^{}]+\})\s+o\s+(\\mathbb\{R\})/g, "$1 \\to $2")
+    .replace(/\\binom\{([^{},]+),([^{}]+)\}/g, "\\{$1,$2\\}");
+  return text.replace(/\s+/g, " ").trim();
+}
+
 function readableLatex(value) {
-  return String(value ?? "")
+  return normalizeLatexFormula(value)
     .trim()
     .replace(/\\frac\{([^{}]+)\}\{([^{}]+)\}/g, "($1)/($2)")
     .replace(/\\sqrt\{([^{}]+)\}/g, "sqrt($1)")
@@ -135,6 +167,8 @@ function readableLatex(value) {
     .replace(/\\pi\b/g, "π")
     .replace(/\\sigma\b/g, "σ")
     .replace(/\\theta\b/g, "θ")
+    .replace(/\\bar\{([^{}]+)\}/g, "$1\u0305")
+    .replace(/\\bullet\b/g, "•")
     .replace(/\\s+/g, " ")
     .replace(/\\([A-Za-z]+)/g, "$1");
 }
@@ -223,29 +257,262 @@ function setResearchRunning(isRunning) {
 }
 
 function renderResearchStatus(run) {
-  const stage = run.stage || run.status || "running";
-  const message = run.message || "";
-  const counts = run.counts || {};
-  const done = Number(counts.llm_batches_done || counts.processed_works || 0);
-  const total = Number(counts.llm_batches_total || counts.found_works || counts.target_works || 0);
-  const percent = total > 0 ? Math.max(4, Math.min(100, Math.round((done / total) * 100))) : (run.status === "complete" ? 100 : 12);
-  const countText = Object.keys(counts).length
-    ? Object.entries(counts)
-        .filter(([, value]) => value !== "" && value != null)
-        .map(([key, value]) => `${key.replaceAll("_", " ")} ${value}`)
-        .join(" / ")
-    : "";
   const running = !["complete", "error", "partial_error", "cancelled"].includes(run.status || "");
+  const plannedWorks = researchPlannedWorks(run);
+  const completedWorks = researchCompletedWorks(run, plannedWorks);
+  const percent = researchProgressPercent(run, completedWorks, plannedWorks);
+  const statusTitle = researchStatusTitle(run, completedWorks, plannedWorks);
+  const statusDetail = researchStatusDetail(run, completedWorks, plannedWorks);
+  const metrics = researchStatusMetrics(run, completedWorks, plannedWorks, running);
+  const substeps = researchStatusSubsteps(run, completedWorks, plannedWorks);
   el("researchStatus").classList.toggle("running", running);
   el("researchStatus").innerHTML = `
     <div class="status-line">
       ${running ? `<span class="status-spinner" aria-hidden="true"></span>` : ""}
-      <strong>${escapeHtml(stage.replaceAll("_", " "))}</strong>
-      <span>${escapeHtml(message)}</span>
+      <strong>${escapeHtml(statusTitle)}</strong>
+      <span>${escapeHtml(statusDetail)}</span>
     </div>
     <div class="progress-track" aria-hidden="true"><span style="width: ${percent}%"></span></div>
-    ${countText ? `<small>${escapeHtml(countText)}</small>` : ""}
+    ${substeps.length ? `
+      <div class="research-substeps" aria-label="Research stage details">
+        ${substeps.map((step) => `<span>${escapeHtml(step)}</span>`).join("")}
+      </div>
+    ` : ""}
+    <div class="research-metrics" aria-label="Research progress">
+      ${metrics.map((metric) => `<span><strong>${escapeHtml(metric.value)}</strong>${escapeHtml(metric.label)}</span>`).join("")}
+    </div>
   `;
+}
+
+function numericCount(counts, keys) {
+  for (const key of keys) {
+    if (counts[key] === 0) return 0;
+    const value = Number(counts[key]);
+    if (Number.isFinite(value) && value > 0) return value;
+  }
+  return 0;
+}
+
+function maxNumericCount(counts, keys) {
+  return keys.reduce((best, key) => {
+    const value = Number(counts[key]);
+    return Number.isFinite(value) ? Math.max(best, value) : best;
+  }, 0);
+}
+
+function hasCount(counts, key) {
+  return counts[key] !== undefined && counts[key] !== null && counts[key] !== "";
+}
+
+function researchStageTitle(stage) {
+  const titles = {
+    starting: "Starting research",
+    query_planning: "Planning source search",
+    query_translation: "Preparing search query",
+    source_search: "Searching paper metadata",
+    source_search_broaden: "Broadening paper search",
+    source_search_warning: "Source search warning",
+    cloud_lookup: "Checking Cloud DB",
+    cloud_hydration: "Loading Cloud DB records",
+    cloud_lookup_skipped: "Cloud lookup skipped",
+    works_storing: "Saving matched works",
+    works_stored: "Saving matched works",
+    research_candidate_selection: "Selecting works to extract",
+    llm_extraction_cache: "Reusing existing extraction",
+    research_batch_queue: "Preparing research batches",
+    full_text_batch: "Fetching batch full text",
+    full_text_fetch: "Fetching batch full text",
+    deterministic_full_text_extraction: "Extracting explicit records",
+    llm_extraction: "Calling LLM extractor",
+    llm_extraction_wait: "Waiting for LLM extractor",
+    llm_extraction_warning: "LLM extraction warning",
+    llm_extraction_persist: "Saving LLM concepts",
+    work_upsert: "Saving extracted works",
+    structured_extraction: "Saving structured records",
+    full_text_batch_cleanup: "Clearing full-text cache",
+    coverage_recovery: "Recovering sparse coverage",
+    complete: "Research complete",
+  };
+  return titles[stage] || "";
+}
+
+function researchPlannedWorks(run) {
+  const counts = run.counts || {};
+  const planKeys = ["planned_works", "structured_works_total", "unresearched_works"];
+  if (planKeys.some((key) => hasCount(counts, key))) return maxNumericCount(counts, planKeys);
+  if (["complete", "cancelled", "error", "partial_error"].includes(run.status || "")) {
+    return numericCount(counts, ["target_works", "found_works"]);
+  }
+  return 0;
+}
+
+function researchCompletedWorks(run, plannedWorks = 0) {
+  if (run.status === "complete" && plannedWorks) return plannedWorks;
+  const counts = run.counts || {};
+  return Math.min(plannedWorks || Number.MAX_SAFE_INTEGER, numericCount(counts, ["processed_works"]));
+}
+
+function researchPartialCompletedWorks(run, completedWorks, plannedWorks) {
+  const counts = run.counts || {};
+  const stage = run.stage || "";
+  if (!plannedWorks) return completedWorks;
+  const batchWorks = Number(counts.batch_works || counts.full_text_total || counts.llm_batches_total || 0);
+  let partial = completedWorks;
+  if (["full_text_batch", "full_text_fetch"].includes(stage)) {
+    const done = Number(counts.full_text_done || 0);
+    const total = Number(counts.full_text_total || batchWorks || 0);
+    if (total > 0) partial += Math.min(batchWorks || total, total) * 0.18 * Math.min(1, done / total);
+  } else if (stage === "deterministic_full_text_extraction") {
+    const done = Number(counts.deterministic_done || 0);
+    const total = Number(counts.deterministic_total || batchWorks || 0);
+    partial += (batchWorks || total || 1) * (0.2 + (total > 0 ? 0.1 * Math.min(1, done / total) : 0));
+  } else if (stage === "llm_extraction" || stage === "llm_extraction_wait") {
+    const done = Number(counts.llm_batches_done || 0);
+    const total = Number(counts.llm_batches_total || batchWorks || 0);
+    partial += (batchWorks || total || 1) * (0.3 + (total > 0 ? 0.55 * Math.min(1, done / total) : 0));
+  } else if (["llm_extraction_persist", "work_upsert", "structured_extraction", "full_text_batch_cleanup"].includes(stage)) {
+    partial += batchWorks ? batchWorks * 0.9 : 0.5;
+  }
+  return Math.min(plannedWorks, partial);
+}
+
+function researchProgressPercent(run, completedWorks, plannedWorks) {
+  if (run.status === "complete") return 100;
+  if (run.status === "cancelled" || run.status === "error" || run.status === "partial_error") {
+    return plannedWorks > 0 ? Math.max(4, Math.min(100, Math.round((completedWorks / plannedWorks) * 100))) : 100;
+  }
+  if (plannedWorks > 0) {
+    const partial = researchPartialCompletedWorks(run, completedWorks, plannedWorks);
+    return Math.max(4, Math.min(96, Math.round((partial / plannedWorks) * 100)));
+  }
+  const stage = run.stage || "";
+  const earlyStagePercent = {
+    starting: 4,
+    query_planning: 8,
+    query_translation: 12,
+    source_search: 18,
+    source_search_broaden: 24,
+    cloud_lookup: 30,
+    cloud_hydration: 34,
+    works_storing: 36,
+    works_stored: 38,
+    research_candidate_selection: 42,
+  };
+  if (earlyStagePercent[stage]) return earlyStagePercent[stage];
+  return 12;
+}
+
+function researchStatusTitle(run, completedWorks, plannedWorks) {
+  if (run.status === "complete") return "Research complete";
+  if (run.status === "cancelled") return "Research stopped";
+  if (run.status === "error" || run.status === "partial_error") return "Research needs attention";
+  if (plannedWorks === 0 && maxNumericCount(run.counts || {}, ["already_researched_works", "skipped_unchanged_llm"]) > 0) return "No new work extraction needed";
+  const stageTitle = researchStageTitle(run.stage || "");
+  if (stageTitle) return stageTitle;
+  if (plannedWorks > 0) return `Researching ${plannedWorks} work${plannedWorks === 1 ? "" : "s"}`;
+  return "Preparing research";
+}
+
+function researchStatusDetail(run, completedWorks, plannedWorks) {
+  if (run.status === "error" || run.status === "partial_error") return run.message || "The run stopped before completion.";
+  if (run.status === "cancelled") return "Completed records were kept.";
+  if (run.status === "complete") return plannedWorks ? `${completedWorks}/${plannedWorks} works completed.` : "No pending work extraction.";
+  const counts = run.counts || {};
+  const batch = Number(counts.research_batch || 0);
+  const totalBatches = Number(counts.research_batches_total || 0);
+  const batchText = batch && totalBatches ? `Batch ${batch}/${totalBatches}, currently ` : "";
+  const message = run.message || "";
+  if (plannedWorks > 0) {
+    const progressText = `${completedWorks}/${plannedWorks} works completed.`;
+    return `${batchText}${progressText}${message ? ` ${message}` : ""}`;
+  }
+  if (hasCount(counts, "source_candidates")) return `${counts.source_candidates} raw candidates found; de-duplicating and ranking.`;
+  if (counts.existing_works || counts.top_up_needed) return message || "Checking the current Works list and filling any gap.";
+  return run.message || "Planning work extraction.";
+}
+
+function formatDuration(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return "Estimating";
+  if (seconds < 60) return `${Math.max(1, Math.round(seconds))}s`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const remainder = minutes % 60;
+  return remainder ? `${hours}h ${remainder}m` : `${hours}h`;
+}
+
+function researchEta(run, completedWorks, plannedWorks, running) {
+  if (!running) return run.status === "complete" ? "0s" : "Stopped";
+  if (!plannedWorks) return "Estimating";
+  const remaining = Math.max(0, plannedWorks - completedWorks);
+  if (!remaining) return "0s";
+  if (!completedWorks) return "Estimating";
+  const startedAt = Date.parse(run.started_at || "");
+  if (!Number.isFinite(startedAt)) return "Estimating";
+  const elapsedSeconds = Math.max(1, (Date.now() - startedAt) / 1000);
+  return formatDuration((elapsedSeconds / completedWorks) * remaining);
+}
+
+function researchStatusMetrics(run, completedWorks, plannedWorks, running) {
+  const counts = run.counts || {};
+  const batch = Number(counts.research_batch || 0);
+  const totalBatches = Number(counts.research_batches_total || 0);
+  const alreadyResearched = maxNumericCount(counts, ["already_researched_works", "skipped_unchanged_llm"]);
+  const targetWorks = Number(counts.target_works || run.target_works || 0);
+  const phase = researchStageTitle(run.stage || "") || (run.stage || run.status || "idle").replaceAll("_", " ");
+  const metrics = [
+    { label: "phase", value: phase },
+    { label: "planned works", value: plannedWorks ? String(plannedWorks) : targetWorks ? `target ${targetWorks}` : "calculating" },
+    { label: "already researched", value: String(alreadyResearched) },
+    { label: "completed", value: plannedWorks ? `${completedWorks}/${plannedWorks}` : String(completedWorks || 0) },
+    { label: "ETA", value: researchEta(run, completedWorks, plannedWorks, running) },
+  ];
+  if (batch && totalBatches) metrics.splice(3, 0, { label: "batch", value: `${batch}/${totalBatches}` });
+  return metrics;
+}
+
+function researchStatusSubsteps(run, completedWorks, plannedWorks) {
+  const counts = run.counts || {};
+  const steps = [];
+  const targetWorks = Number(counts.target_works || run.target_works || 0);
+  const foundWorks = Number(counts.found_works || counts.source_candidates || 0);
+  const storedWorks = Number(counts.stored_works || 0);
+  if (targetWorks || foundWorks || storedWorks) {
+    const workParts = [];
+    if (targetWorks) workParts.push(`target ${targetWorks}`);
+    if (foundWorks) workParts.push(`${foundWorks} found`);
+    if (storedWorks) workParts.push(`${storedWorks} saved`);
+    if (workParts.length) steps.push(`Works: ${workParts.join(" · ")}`);
+  }
+  const already = maxNumericCount(counts, ["already_researched_works", "skipped_unchanged_llm"]);
+  if (plannedWorks || already) steps.push(`Extraction plan: ${plannedWorks} pending · ${already} already researched`);
+  const batch = Number(counts.research_batch || 0);
+  const totalBatches = Number(counts.research_batches_total || 0);
+  if (batch || totalBatches) {
+    const batchWorks = Number(counts.batch_works || 0);
+    steps.push(`Batch: ${batch || 0}/${totalBatches || "?"}${batchWorks ? ` · ${batchWorks} works` : ""}`);
+  }
+  if (hasCount(counts, "full_text_total") || hasCount(counts, "full_text_done")) {
+    const done = Number(counts.full_text_done || 0);
+    const total = Number(counts.full_text_total || 0);
+    const available = Number(counts.full_text_available || 0);
+    steps.push(`Full text: ${done}/${total || "?"} fetched${available ? ` · ${available} available` : ""}`);
+  }
+  if (hasCount(counts, "deterministic_total") || hasCount(counts, "deterministic_done")) {
+    steps.push(`Explicit records: ${Number(counts.deterministic_done || 0)}/${Number(counts.deterministic_total || 0) || "?"} parsed`);
+  }
+  if (hasCount(counts, "llm_batches_total") || hasCount(counts, "llm_batches_done")) {
+    const failed = Number(counts.llm_failed_batches || 0);
+    steps.push(`LLM calls: ${Number(counts.llm_batches_done || 0)}/${Number(counts.llm_batches_total || 0) || "?"} complete${failed ? ` · ${failed} failed` : ""}`);
+  }
+  if (plannedWorks) steps.push(`Structured save: ${completedWorks}/${plannedWorks} works`);
+  if (Number(counts.full_text_retained || 0) === 0 && run.stage === "full_text_batch_cleanup") steps.push("Transient full text cleared for this batch");
+  const recordBits = [];
+  for (const [label, key] of [["ideas", "existed_ideas"], ["principles", "principles"], ["takeaways", "takeaway_messages"], ["benchmarks", "benchmarks"], ["baselines", "baselines"]]) {
+    if (Number(counts[key] || 0) > 0) recordBits.push(`${counts[key]} ${label}`);
+  }
+  if (recordBits.length) steps.push(`Saved records: ${recordBits.join(" · ")}`);
+  return steps.slice(0, 6);
 }
 
 function renderIdeaGenerationStatus(run) {
@@ -311,6 +578,125 @@ function getModelMode() {
   return el("modelModeInput").value || "auto";
 }
 
+function isAdminMode() {
+  return state.systemMode === "admin" && state.adminAuthenticated;
+}
+
+function updateSystemModeUI() {
+  document.body.dataset.systemMode = isAdminMode() ? "admin" : "user";
+  const input = el("systemModeInput");
+  if (input) input.value = isAdminMode() ? "admin" : "user";
+  const hint = el("systemModeHint");
+  if (hint) {
+    if (isAdminMode()) {
+      hint.textContent = "Admin mode unlocked for this local session. Homepage cloud write controls are enabled.";
+    } else if (state.adminConfigured) {
+      hint.textContent = "User mode is active. Enter the admin key to enable homepage cloud write controls.";
+    } else {
+      hint.textContent = "User mode is active. No local admin key is configured on the server.";
+    }
+  }
+}
+
+function openAdminUnlockModal() {
+  const modal = el("adminUnlockModal");
+  if (!modal) return;
+  const input = el("adminKeyInput");
+  const status = el("adminUnlockStatus");
+  if (input) input.value = "";
+  if (status) {
+    status.textContent = state.adminConfigured ? "Enter the local admin key to continue." : "Admin mode is not configured on this server.";
+    status.className = "muted";
+  }
+  modal.hidden = false;
+  window.setTimeout(() => input?.focus(), 0);
+}
+
+function closeAdminUnlockModal() {
+  const modal = el("adminUnlockModal");
+  if (modal) modal.hidden = true;
+  const input = el("systemModeInput");
+  if (input) input.value = isAdminMode() ? "admin" : "user";
+}
+
+async function refreshAdminSession() {
+  try {
+    const data = await api("/api/v1/admin/session");
+    state.adminConfigured = Boolean(data.configured);
+    state.adminAuthenticated = Boolean(data.authenticated);
+    state.systemMode = state.adminAuthenticated && localStorage.getItem("principia.systemMode") === "admin" ? "admin" : "user";
+    if (!state.adminAuthenticated) localStorage.setItem("principia.systemMode", "user");
+  } catch (error) {
+    state.adminConfigured = false;
+    state.adminAuthenticated = false;
+    state.systemMode = "user";
+    localStorage.setItem("principia.systemMode", "user");
+  }
+  updateSystemModeUI();
+}
+
+async function submitAdminUnlock(event) {
+  event.preventDefault();
+  const input = el("adminKeyInput");
+  const button = el("unlockAdminBtn");
+  const status = el("adminUnlockStatus");
+  const key = input?.value || "";
+  if (!key.trim()) {
+    if (status) {
+      status.textContent = "Enter the admin key.";
+      status.className = "muted error";
+    }
+    return;
+  }
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Unlocking...";
+  }
+  if (status) {
+    status.textContent = "Verifying locally...";
+    status.className = "muted";
+  }
+  try {
+    const data = await post("/api/v1/admin/login", { admin_key: key });
+    state.adminConfigured = Boolean(data.configured);
+    state.adminAuthenticated = Boolean(data.authenticated);
+    state.systemMode = state.adminAuthenticated ? "admin" : "user";
+    localStorage.setItem("principia.systemMode", state.systemMode);
+    closeAdminUnlockModal();
+    updateSystemModeUI();
+    window.setTimeout(() => renderTabContent({ stable: true }), 0);
+    showToast("Admin mode unlocked for this session.");
+  } catch (error) {
+    state.adminAuthenticated = false;
+    state.systemMode = "user";
+    localStorage.setItem("principia.systemMode", "user");
+    updateSystemModeUI();
+    if (status) {
+      status.textContent = error.message || "Admin key rejected.";
+      status.className = "muted error";
+    }
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = "Unlock Admin Mode";
+    }
+    if (input) input.value = "";
+  }
+}
+
+async function switchToUserMode() {
+  try {
+    await post("/api/v1/admin/logout", {});
+  } catch (error) {
+    // The local UI should still leave admin mode even if the logout request fails.
+  }
+  state.adminAuthenticated = false;
+  state.systemMode = "user";
+  localStorage.setItem("principia.systemMode", "user");
+  updateSystemModeUI();
+  window.setTimeout(() => renderTabContent({ stable: true }), 0);
+}
+
 function getAssemblerModelMode() {
   return el("assemblerModelMode")?.value || getModelMode();
 }
@@ -331,7 +717,7 @@ function getTargetWorks() {
 
 function idFor(tabKey, item) {
   const tab = tabs.find((entry) => entry.key === tabKey || entry.bucket === tabKey);
-  return item?.[tab?.idKey] || item?.canonical_id || item?.benchmark_id || item?.baseline_id || item?.idea_id || "";
+  return item?.[tab?.idKey] || item?.canonical_id || item?.benchmark_id || item?.baseline_id || item?.idea_id || item?.concept_id || "";
 }
 
 function recordIdForEvidence(sourceType, item) {
@@ -529,17 +915,22 @@ async function selectProject(fieldId) {
   await loadTab({ reset: true });
 }
 
-async function loadTab({ reset = false, preserveScroll = false, silent = false } = {}) {
+async function loadTab({ reset = false, preserveScroll = false, silent = false, pageDelta = 0, page = null } = {}) {
   const priorScrollY = window.scrollY;
-  if (reset) {
+  if (page !== null && page !== undefined) {
+    const targetPage = Math.max(1, Number(page) || 1);
+    state.offset = (targetPage - 1) * state.limit;
+    if (!silent) el("tabContent").innerHTML = `<div class="loading-row">Loading ${escapeHtml(tabLabel(state.activeTab))}...</div>`;
+  } else if (reset) {
     state.offset = 0;
     if (!silent) {
       state.items = [];
       state.tabRenderSignature = "";
       el("tabContent").innerHTML = `<div class="loading-row">Loading ${escapeHtml(tabLabel(state.activeTab))}...</div>`;
     }
-  } else {
-    el("moreBtn").textContent = "Loading...";
+  } else if (pageDelta) {
+    state.offset = Math.max(0, state.offset + pageDelta * state.limit);
+    el("tabContent").innerHTML = `<div class="loading-row">Loading ${escapeHtml(tabLabel(state.activeTab))}...</div>`;
   }
   const params = new URLSearchParams({
     field_id: state.activeProjectId,
@@ -554,20 +945,60 @@ async function loadTab({ reset = false, preserveScroll = false, silent = false }
     const data = await api(`/api/v1/project/tab?${params.toString()}`);
     state.counts = data.counts || state.counts;
     if (state.activeTab === "works") state.workExtractRuns = data.work_extraction_runs || {};
-    state.items = reset ? data.items || [] : [...state.items, ...(data.items || [])];
-    state.offset = state.items.length;
+    state.items = data.items || [];
+    state.offset = Number(data.offset || state.offset || 0);
+    state.total = Number(data.total || 0);
     state.hasMore = Boolean(data.has_more);
     renderTabs();
     renderTabContent({ stable: silent });
-    el("moreBtn").hidden = !state.hasMore;
+    renderPager();
   } catch (error) {
     el("tabContent").innerHTML = `<div class="empty-state"><strong>Unable to load.</strong><span>${escapeHtml(error.message)}</span></div>`;
   } finally {
-    el("moreBtn").textContent = "More";
     if (preserveScroll) {
       requestAnimationFrame(() => window.scrollTo({ top: priorScrollY, behavior: "auto" }));
     }
   }
+}
+
+function renderPager() {
+  const pager = el("moreBtn");
+  if (!pager) return;
+  const total = Number(state.total || 0);
+  const page = Math.floor(Number(state.offset || 0) / state.limit) + 1;
+  const pages = Math.max(1, Math.ceil(total / state.limit));
+  pager.hidden = total <= state.limit;
+  const info = el("pageInfo");
+  if (info) info.textContent = `Page ${page} of ${pages}`;
+  const numbers = el("pageNumbers");
+  if (numbers) {
+    numbers.innerHTML = visiblePagerPages(page, pages)
+      .map((entry) => {
+        if (entry === "...") return `<span class="page-ellipsis">...</span>`;
+        const active = Number(entry) === page;
+        return `<button type="button" class="page-number ${active ? "active" : ""}" data-page-number="${entry}" ${active ? "aria-current=\"page\"" : ""}>${entry}</button>`;
+      })
+      .join("");
+  }
+  const prev = pager.querySelector("[data-page-action='prev']");
+  const next = pager.querySelector("[data-page-action='next']");
+  if (prev) prev.disabled = state.offset <= 0;
+  if (next) next.disabled = !state.hasMore;
+}
+
+function visiblePagerPages(current, total) {
+  const pages = new Set([1, total]);
+  for (let value = current - 2; value <= current + 2; value += 1) {
+    if (value >= 1 && value <= total) pages.add(value);
+  }
+  const sorted = [...pages].sort((a, b) => a - b);
+  const output = [];
+  sorted.forEach((value, index) => {
+    const previous = sorted[index - 1];
+    if (previous && value - previous > 1) output.push("...");
+    output.push(value);
+  });
+  return output;
 }
 
 function renderTabContent({ stable = false } = {}) {
@@ -629,7 +1060,7 @@ function renderWork(item) {
     item,
     `
       <div>
-        <h3>${escapeHtml(item.title || "Untitled Work")}</h3>
+        <h3 class="record-title-line">${escapeHtml(item.title || "Untitled Work")} ${cloudTitleBadge(item)}</h3>
         <p>${escapeHtml(compact(item.abstract || item.summary || "No abstract available.", 320))}</p>
         <div class="record-meta">
           <span>${escapeHtml(item.venue_or_source || item.source_type || "source")}</span>
@@ -638,7 +1069,7 @@ function renderWork(item) {
         </div>
       </div>
       <div class="record-actions">
-        <button type="button" data-action="add-material">Add Material</button>
+        ${materialActionButton("works", item)}
         <button type="button" data-action="extract-work" class="${extractClass}" title="${escapeHtml(extractTitle)}">${escapeHtml(extractLabel)}</button>
         ${cloudSyncButton(item)}
         <button type="button" data-action="details">Details</button>
@@ -657,6 +1088,56 @@ function tabKeyForBucket(bucket) {
 
 function materialTabs() {
   return new Set(["works", "existed_ideas", "benchmarks", "baselines", "principles", "takeaway_messages"]);
+}
+
+function materialRefKey(bucket, id) {
+  return `${bucket}:${id}`;
+}
+
+function selectedMaterialKeys() {
+  return new Set((state.assembler.selected || []).map((ref) => materialRefKey(ref.bucket, ref.id)));
+}
+
+function isMaterialSelected(bucket, id) {
+  return selectedMaterialKeys().has(materialRefKey(bucket, id));
+}
+
+function materialActionButton(tabKey, item, label = "Add Material") {
+  const id = idFor(tabKey, item || {});
+  const selected = isMaterialSelected(tabKey, id);
+  return `<button type="button" data-action="add-material" class="${selected ? "material-added" : ""}" ${selected ? "disabled" : ""}>${selected ? "Added" : escapeHtml(label)}</button>`;
+}
+
+function evidenceActionButton(bucket, id) {
+  const selected = isMaterialSelected(bucket, id);
+  return `<button type="button" data-action="add-evidence" class="${selected ? "material-added" : ""}" ${selected ? "disabled" : ""}>${selected ? "Added" : "Add"}</button>`;
+}
+
+function refreshEvidenceButtonStates() {
+  document.querySelectorAll("[data-action='add-material']").forEach((button) => {
+    const row = button.closest("[data-tab][data-id]");
+    if (!row) return;
+    const selected = isMaterialSelected(row.dataset.tab, row.dataset.id);
+    button.classList.toggle("material-added", selected);
+    button.disabled = selected;
+    button.textContent = selected ? "Added" : "Add Material";
+  });
+  document.querySelectorAll("[data-action='add-evidence']").forEach((button) => {
+    const card = button.closest("[data-bucket][data-id]");
+    if (!card) return;
+    const selected = isMaterialSelected(card.dataset.bucket, card.dataset.id);
+    button.classList.toggle("material-added", selected);
+    button.disabled = selected;
+    button.textContent = selected ? "Added" : "Add";
+  });
+  const detailButton = el("detailAddMaterialBtn");
+  if (detailButton && state.detail?.bucket) {
+    const tabKey = tabKeyForBucket(state.detail.bucket);
+    const selected = materialTabs().has(tabKey) && isMaterialSelected(tabKey, idFor(tabKey, state.detail.item || {}) || state.detail.id);
+    detailButton.classList.toggle("material-added", selected);
+    detailButton.disabled = selected;
+    detailButton.textContent = selected ? "Added" : "Add Material";
+  }
 }
 
 function normalizedDisplayText(value) {
@@ -688,10 +1169,93 @@ function rowShell(tabKey, item, body) {
 }
 
 function cloudSyncButton(item) {
-  if (item.cloud_sync_status === "synced") {
-    return `<button type="button" class="work-extract-done" disabled>Cloud Synced</button>`;
+  if (!isAdminMode()) return "";
+  if (cloudRecordMatchesTarget(item)) {
+    return `<button type="button" class="work-extract-done cloud-write-action" disabled>Cloud Synced</button>`;
   }
-  return `<button type="button" data-action="sync-cloud">Sync Cloud</button>`;
+  return `<button type="button" class="cloud-write-action" data-action="sync-cloud">Sync Cloud</button>`;
+}
+
+function setCloudSyncButtonState(button, stateName, label) {
+  if (!button) return;
+  button.dataset.cloudSyncState = stateName;
+  button.textContent = label;
+  button.disabled = stateName !== "idle";
+  button.classList.toggle("is-publishing", ["syncing", "publishing"].includes(stateName));
+  button.classList.toggle("is-pending", stateName === "pending");
+  button.classList.toggle("work-extract-done", stateName === "synced");
+}
+
+function cloudSyncElapsedLabel(startedAt) {
+  const seconds = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+  if (seconds < 60) return `Publishing... ${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const rest = String(seconds % 60).padStart(2, "0");
+  return `Publishing... ${minutes}:${rest}`;
+}
+
+function cloudOriginForItem(item) {
+  const origin = item.cloud_origin || item.active_variant?.payload?.cloud_origin || item.active_variant?.cloud_origin || {};
+  return origin && typeof origin === "object" ? origin : {};
+}
+
+function modelModeFromCloudKey(modelKey) {
+  return String(modelKey || "").split(":")[2] || "";
+}
+
+function cloudOriginMatchesTarget(item) {
+  const origin = cloudOriginForItem(item);
+  if (!origin.cloud_snapshot_id) return false;
+  const mode = getModelMode();
+  if (mode === "auto") return true;
+  const originMode = origin.cloud_model_mode || origin.model_mode || modelModeFromCloudKey(origin.cloud_model_key || origin.model_key || "");
+  return originMode === mode;
+}
+
+function cloudSyncMatchesTarget(item) {
+  if (item.cloud_sync_status !== "synced") return false;
+  const mode = getModelMode();
+  if (mode === "auto") return true;
+  const syncByModel = item.cloud_sync_by_model && typeof item.cloud_sync_by_model === "object" ? item.cloud_sync_by_model : {};
+  const modes = [];
+  const keys = [
+    item.cloud_sync_model_key,
+    item.model_key,
+    ...Object.keys(syncByModel),
+  ].filter(Boolean);
+  for (const key of keys) {
+    const keyMode = modelModeFromCloudKey(key);
+    if (keyMode && !modes.includes(keyMode)) modes.push(keyMode);
+  }
+  for (const entry of Object.values(syncByModel)) {
+    if (entry?.model_mode && !modes.includes(entry.model_mode)) modes.push(entry.model_mode);
+  }
+  if (item.model_mode && !modes.includes(item.model_mode)) modes.push(item.model_mode);
+  return !modes.length || modes.includes(mode);
+}
+
+function cloudRecordMatchesTarget(item) {
+  return cloudOriginMatchesTarget(item) || cloudSyncMatchesTarget(item);
+}
+
+function cloudTitleBadge(item) {
+  if (!cloudRecordMatchesTarget(item)) return "";
+  const origin = cloudOriginForItem(item);
+  const modelName = modelNameFromCloudKey(origin.cloud_model_key || origin.model_key || item.cloud_sync_model_key || item.model_key || "");
+  const title = modelName ? `Cloud DB record from ${modelName}` : "Cloud DB record";
+  return `<span class="title-cloud-badge" title="${escapeHtml(title)}">Cloud DB</span>`;
+}
+
+function cloudOriginBadge(item) {
+  const origin = cloudOriginForItem(item);
+  if (!cloudRecordMatchesTarget(item)) return "";
+  const modelName = modelNameFromCloudKey(origin.cloud_model_key || origin.model_key || item.cloud_sync_model_key || item.model_key || "");
+  return `<span class="record-badge cloud-badge">Cloud DB${modelName ? ` · ${escapeHtml(modelName)}` : ""}</span>`;
+}
+
+function modelNameFromCloudKey(modelKey) {
+  const parts = String(modelKey || "").split(":");
+  return parts[1] || "";
 }
 
 function renderSymbolBadges(item) {
@@ -709,7 +1273,7 @@ function renderExistedIdea(item) {
     item,
     `
       <div>
-        <h3>${escapeHtml(item.title || compact(item.idea_text, 88) || "Existed Idea")}</h3>
+        <h3 class="record-title-line">${escapeHtml(item.title || compact(item.idea_text, 88) || "Existed Idea")} ${cloudTitleBadge(item)}</h3>
         <p>${escapeHtml(compact(item.core_idea || item.idea_text || item.summary, 300))}</p>
         <div class="record-meta">
           <span>${escapeHtml(item.venue_or_source || "source")}</span>
@@ -718,7 +1282,7 @@ function renderExistedIdea(item) {
         </div>
       </div>
       <div class="record-actions">
-        <button type="button" data-action="add-material">Add Material</button>
+        ${materialActionButton("existed_ideas", item)}
         ${cloudSyncButton(item)}
         <button type="button" data-action="details">Details</button>
       </div>
@@ -732,7 +1296,7 @@ function renderPrinciple(item) {
     item,
     `
       <div>
-        <h3>${escapeHtml(principleDisplayTitle(item))}</h3>
+        <h3 class="record-title-line">${escapeHtml(principleDisplayTitle(item))} ${cloudTitleBadge(item)}</h3>
         <p>${escapeHtml(compact(item.argument || item.abstract_signature || item.summary, 300))}</p>
         <div class="record-meta">
           <span>${escapeHtml(item.venue_or_source || "source")}</span>
@@ -741,7 +1305,7 @@ function renderPrinciple(item) {
         </div>
       </div>
       <div class="record-actions">
-        <button type="button" data-action="add-material">Add Material</button>
+        ${materialActionButton("principles", item)}
         ${cloudSyncButton(item)}
         <button type="button" data-action="details">Details</button>
       </div>
@@ -755,7 +1319,7 @@ function renderTakeawayMessage(item) {
     item,
     `
       <div>
-        <h3>${escapeHtml(item.title || compact(item.main_results || item.message_text, 88) || "Takeaway Message")}</h3>
+        <h3 class="record-title-line">${escapeHtml(item.title || compact(item.main_results || item.message_text, 88) || "Takeaway Message")} ${cloudTitleBadge(item)}</h3>
         <p>${escapeHtml(compact(item.main_results || item.message_text || item.finding || item.actionable_lesson, 300))}</p>
         <div class="record-meta">
           <span>${escapeHtml(item.venue_or_source || "source")}</span>
@@ -764,7 +1328,7 @@ function renderTakeawayMessage(item) {
         </div>
       </div>
       <div class="record-actions">
-        <button type="button" data-action="add-material">Add Material</button>
+        ${materialActionButton("takeaway_messages", item)}
         ${cloudSyncButton(item)}
         <button type="button" data-action="details">Details</button>
       </div>
@@ -773,18 +1337,19 @@ function renderTakeawayMessage(item) {
 }
 
 function renderBenchmark(item) {
+  const metrics = Array.isArray(item.metrics) ? item.metrics : [item.metrics || item.metric].filter(Boolean);
   return rowShell(
     "benchmarks",
     item,
     `
       <div class="benchmark-row-grid">
-        <div><span class="mini-label">Benchmark</span><strong>${escapeHtml(item.benchmark_name || item.dataset || "Benchmark")}</strong></div>
+        <div><span class="mini-label">Benchmark</span><strong class="record-title-line">${escapeHtml(item.benchmark_name || item.dataset || "Benchmark")} ${cloudTitleBadge(item)}</strong></div>
         <div><span class="mini-label">Task</span><span>${escapeHtml(compact(item.task || "unspecified", 74))}</span></div>
         <div><span class="mini-label">Data Form</span><span>${escapeHtml(compact(item.data_form || "public dataset", 74))}</span></div>
-        <div><span class="mini-label">Metrics</span><span>${escapeHtml(compact((item.metrics || [item.metric]).filter(Boolean).join(", "), 74))}</span></div>
+        <div><span class="mini-label">Metrics</span><span>${escapeHtml(compact(metrics.join(", "), 74))}</span></div>
       </div>
       <div class="record-actions">
-        <button type="button" data-action="add-material">Add Material</button>
+        ${materialActionButton("benchmarks", item)}
         ${cloudSyncButton(item)}
         <button type="button" data-action="details">Details</button>
       </div>
@@ -798,7 +1363,7 @@ function renderBaseline(item) {
     item,
     `
       <div>
-        <h3>${escapeHtml(item.baseline_name || "Baseline")}</h3>
+        <h3 class="record-title-line">${escapeHtml(item.baseline_name || "Baseline")} ${cloudTitleBadge(item)}</h3>
         <p>${escapeHtml(compact(item.core_idea || item.methodology || item.description || item.principle, 300))}</p>
         <div class="record-meta">
           <span>${escapeHtml(item.baseline_type || "published")}</span>
@@ -807,7 +1372,7 @@ function renderBaseline(item) {
         </div>
       </div>
       <div class="record-actions">
-        <button type="button" data-action="add-material">Add Material</button>
+        ${materialActionButton("baselines", item)}
         ${cloudSyncButton(item)}
         <button type="button" data-action="details">Details</button>
       </div>
@@ -837,7 +1402,7 @@ function renderMyIdea(item) {
 
 async function openDetail(tabKey, id, version = "") {
   const tab = tabs.find((entry) => entry.key === tabKey);
-  const params = new URLSearchParams({ bucket: tab.bucket, id, version, model_mode: getModelMode() });
+  const params = new URLSearchParams({ bucket: tab.bucket, id, version, model_mode: getModelMode(), field_id: state.activeProjectId });
   const data = await api(`/api/v1/item/detail?${params.toString()}`);
   state.detail = { bucket: tab.bucket, id, item: data.item };
   renderDetailModal(data.item);
@@ -851,6 +1416,8 @@ function renderDetailModal(item) {
     : item.title || item.name || item.benchmark_name || item.baseline_name || "Details";
   const detailTabKey = tabKeyForBucket(state.detail.bucket);
   el("detailAddMaterialBtn").hidden = !materialTabs().has(detailTabKey);
+  el("detailAddMaterialBtn").textContent = "Add Material";
+  el("detailAddMaterialBtn").disabled = false;
   const versions = item.versions || [];
   el("detailVersionSelect").innerHTML = versions.length
     ? versions.map((version) => `<option value="${escapeHtml(version.version_id)}" ${version.version_id === item.active_variant?.version_id ? "selected" : ""}>${escapeHtml(version.is_user_edit ? "manual" : `${version.provider}:${version.model_name}`)} · ${escapeHtml(version.extracted_at || "")}</option>`).join("")
@@ -860,6 +1427,7 @@ function renderDetailModal(item) {
   renderDetailEditFields(item);
   el("detailEditForm").hidden = true;
   typesetMath(el("detailModal"));
+  refreshEvidenceButtonStates();
 }
 
 function renderDetailEditFields(item) {
@@ -1097,7 +1665,10 @@ function detailSections(item) {
 
 function detailBlock(title, content) {
   if (!content) return "";
-  return `<section><h3>${escapeHtml(title)}</h3><p>${escapeHtml(Array.isArray(content) ? content.join("; ") : content)}</p></section>`;
+  const body = Array.isArray(content)
+    ? `<ul>${content.map((item) => `<li>${formatValue(item)}</li>`).join("")}</ul>`
+    : `<p>${formatValue(content)}</p>`;
+  return `<section><h3>${escapeHtml(title)}</h3>${body}</section>`;
 }
 
 function detailList(title, content) {
@@ -1108,11 +1679,23 @@ function detailList(title, content) {
 function formatValue(value) {
   if (value == null || value === "") return "";
   if (typeof value !== "object") return escapeHtml(value);
-  if (Array.isArray(value)) return value.map(formatValue).join("; ");
+  if (Array.isArray(value)) return value.map(formatValue).filter(Boolean).join("; ");
+  const structuredText = structuredObjectText(value);
+  if (structuredText) return escapeHtml(structuredText);
   return `<dl class="inline-object">${Object.entries(value)
     .filter(([, val]) => val !== "" && val != null && !(Array.isArray(val) && !val.length))
     .map(([key, val]) => `<dt>${escapeHtml(humanizeKey(key))}</dt><dd>${formatValue(val)}</dd>`)
     .join("")}</dl>`;
+}
+
+function structuredObjectText(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return "";
+  const label = value.component || value.step || value.name || value.title || value.module || value.operator || value.role || "";
+  const body = value.description || value.text || value.summary || value.mechanism || value.argument || value.rationale || value.detail || value.details || value.method || "";
+  if (label && body) return `${label}. ${body}`;
+  if (body) return String(body);
+  if (label) return String(label);
+  return "";
 }
 
 function humanizeKey(key) {
@@ -1212,7 +1795,7 @@ async function pollResearch() {
     if (run.status === "running" && signature && signature !== state.researchCountsSignature) {
       state.researchCountsSignature = signature;
       await loadSummary();
-      await loadTab({ reset: true, preserveScroll: true, silent: true });
+      await loadTab({ reset: false, preserveScroll: true, silent: true });
     }
     if ((run.warnings || []).length && state.warningRunId !== run.run_id) {
       state.warningRunId = run.run_id;
@@ -1224,7 +1807,7 @@ async function pollResearch() {
       state.researchRunProjectId = "";
       await loadProjects(state.activeProjectId);
       await loadSummary();
-      await loadTab({ reset: true, preserveScroll: true, silent: true });
+      await loadTab({ reset: false, preserveScroll: true, silent: true });
       return;
     }
     if (run.status === "cancelled") {
@@ -1247,7 +1830,7 @@ async function pollResearch() {
       state.researchRunProjectId = "";
       await loadProjects(state.activeProjectId);
       await loadSummary();
-      await loadTab({ reset: true, preserveScroll: true, silent: true });
+      await loadTab({ reset: false, preserveScroll: true, silent: true });
       alert(run.message || "Research stopped after preserving completed records.");
       return;
     }
@@ -1311,8 +1894,8 @@ async function syncRecordToCloud(tabKey, id, button) {
   const tab = tabs.find((entry) => entry.key === tabKey);
   if (!tab || !id) return;
   const prior = button.textContent;
-  button.disabled = true;
-  button.textContent = "Syncing...";
+  let buttonManagedByPoll = false;
+  setCloudSyncButtonState(button, "syncing", "Syncing...");
   try {
     const data = await post("/api/v1/cloud/upload/record", {
       field_id: state.activeProjectId,
@@ -1321,20 +1904,98 @@ async function syncRecordToCloud(tabKey, id, button) {
       model_mode: getModelMode(),
       upload_mode: "normal",
     });
-    const pushed = data.direct_push && data.direct_push.pushed;
-    if (pushed) {
+    const published = Boolean(data.ok && data.cloud_publish?.available_for_search);
+    if (published) {
+      buttonManagedByPoll = true;
+      setCloudSyncButtonState(button, "synced", "Cloud Synced");
       showToast("Synced to Principia Cloud.");
       await loadSummary();
-      await loadTab({ reset: true, preserveScroll: true, silent: true });
+      await loadTab({ reset: false, preserveScroll: true, silent: true });
       return;
     }
-    showToast(data.prepared?.path ? "Cloud contribution prepared; direct push did not complete." : "Cloud sync was not allowed for this record.", "error");
+    if (data.background_publish?.started || data.status === "publishing") {
+      const uploadId = data.upload_id || data.background_publish?.upload_id || "";
+      buttonManagedByPoll = true;
+      setCloudSyncButtonState(button, "publishing", "Publishing... 0s");
+      showToast("Cloud sync accepted. Publishing searchable records in the background.", "info");
+      pollCloudUploadStatus(uploadId, { button, priorText: prior }).catch((error) => {
+        setCloudSyncButtonState(button, "idle", prior);
+        showToast(error.message || "Unable to check cloud sync status.", "error");
+      });
+      return;
+    }
+    const reason = summarizeCloudUploadDecisions(data.prepared?.upload_decisions || data.upload_decisions || []);
+    showToast(data.direct_push?.error || data.cloud_publish?.message || reason || "Cloud sync was not allowed for this record.", "error");
   } catch (error) {
     showToast(error.message || "Unable to sync this record.", "error");
   } finally {
-    button.disabled = false;
-    button.textContent = prior;
+    if (!buttonManagedByPoll) {
+      setCloudSyncButtonState(button, "idle", prior);
+    }
   }
+}
+
+async function pollCloudUploadStatus(uploadId, options = {}) {
+  if (!uploadId) return;
+  const config = typeof options === "number" ? { attempts: options } : options || {};
+  const attempts = Number(config.attempts || 90);
+  const button = config.button || null;
+  const priorText = config.priorText || "Sync Cloud";
+  const startedAt = Date.now();
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (button?.isConnected) {
+      setCloudSyncButtonState(button, "publishing", cloudSyncElapsedLabel(startedAt));
+    }
+    const delay = attempt < 10 ? 1000 : attempt < 30 ? 2500 : 5000;
+    await new Promise((resolve) => window.setTimeout(resolve, delay));
+    const data = await api(`/api/v1/cloud/upload/status?upload_id=${encodeURIComponent(uploadId)}`);
+    const item = data.item || {};
+    const status = String(item.status || "");
+    if (status === "published") {
+      if (button?.isConnected) {
+        setCloudSyncButtonState(button, "synced", "Cloud Synced");
+      }
+      showToast("Cloud sync published and searchable.");
+      await loadSummary();
+      await loadTab({ reset: false, preserveScroll: true, silent: true });
+      return;
+    }
+    if (status === "error") {
+      const detail = String(item.github_pr_url || "").replace(/^error:\s*/i, "");
+      if (button?.isConnected) {
+        setCloudSyncButtonState(button, "idle", priorText);
+      }
+      showToast(detail || "Cloud sync failed during background publishing.", "error");
+      return;
+    }
+    if (status === "submitted" || status === "prepared") {
+      if (button?.isConnected) {
+        setCloudSyncButtonState(button, "pending", status === "submitted" ? "Release Pending" : "Prepared");
+      }
+      showToast("Cloud contribution was submitted. Searchable release publication is still pending.", "info");
+      return;
+    }
+  }
+  if (button?.isConnected) {
+    setCloudSyncButtonState(button, "pending", "Still Publishing");
+  }
+  showToast("Cloud sync is still publishing in the background.", "info");
+}
+
+function summarizeCloudUploadDecisions(decisions) {
+  const rejected = (decisions || []).filter((item) => !item.upload_allowed);
+  if (!rejected.length) return "";
+  return rejected.slice(0, 3).map((item) => `${item.title || item.work_id}: ${cloudUploadDecisionText(item)}`).join(" · ");
+}
+
+function cloudUploadDecisionText(item) {
+  if (item.cloud_decision === "missing_required_extractions") {
+    return `missing ${[...new Set(item.missing_required_extractions || [])].join(", ") || "required extractions"}`;
+  }
+  if (["cloud_cache_hit", "source_unchanged"].includes(item.cloud_decision)) {
+    return "cloud already has this model version and source is unchanged";
+  }
+  return String(item.cloud_decision || "rejected").replaceAll("_", " ");
 }
 
 async function pollWorkExtraction() {
@@ -1375,7 +2036,7 @@ async function pollWorkExtraction() {
     state.workExtractRunId = Object.values(state.workExtractRuns || {})[0]?.run_id || "";
     if (terminalChanged) {
       await loadSummary();
-      await loadTab({ reset: true, preserveScroll: true, silent: true });
+      await loadTab({ reset: false, preserveScroll: true, silent: true });
       if (!state.workExtractRunId) clearTransientStatus("Ready");
     } else {
       renderTabContent({ stable: true });
@@ -1429,14 +2090,14 @@ async function deleteProject(fieldId) {
   const project = state.projects.find((item) => item.field_id === fieldId);
   state.deleteProject = { fieldId };
   el("deleteProjectTitle").textContent = `Delete ${project?.name || "Project"}`;
-  el("deleteProjectMessage").textContent = "This removes the project from the sidebar immediately. Local works, concepts, ideas, benchmarks, and baselines are kept unless you choose the cleanup option below.";
-  el("deleteProjectLocalDataInput").checked = false;
+  el("deleteProjectMessage").textContent = "This removes the project and local records used only by this project. Uncheck the cleanup option only when you deliberately want to keep orphaned local records.";
+  el("deleteProjectLocalDataInput").checked = true;
   el("deleteProjectModal").hidden = false;
 }
 
 function closeDeleteProjectModal() {
   el("deleteProjectModal").hidden = true;
-  el("deleteProjectLocalDataInput").checked = false;
+  el("deleteProjectLocalDataInput").checked = true;
   state.deleteProject = { fieldId: "" };
 }
 
@@ -1525,7 +2186,7 @@ function renderAssemblerSources() {
               <strong>${escapeHtml(label)}</strong>
               <p>${escapeHtml(compact(item.core_idea || item.argument || item.main_results || item.idea_text || item.message_text || item.abstract_signature || item.abstract || item.summary || item.methodology || item.description || item.principle, 145))}</p>
               <div class="evidence-actions">
-                <button type="button" data-action="add-evidence">Add</button>
+                ${evidenceActionButton(state.assembler.sourceType, id)}
                 <button type="button" data-action="view-evidence">View</button>
               </div>
             </article>
@@ -1547,6 +2208,7 @@ function addEvidence(bucket, id) {
   const item = state.assembler.items.find((entry) => recordIdForEvidence(bucket, entry) === id) || null;
   state.assembler.selected.push({ bucket, id, item });
   renderSelectedEvidence();
+  refreshEvidenceButtonStates();
   if (item) renderAssemblerDetail(item);
   showToast("Material added to Generate Idea.");
 }
@@ -1556,12 +2218,14 @@ function unselectVisibleEvidence() {
   const visibleIds = new Set(state.assembler.items.map((item) => recordIdForEvidence(source, item)).filter(Boolean));
   state.assembler.selected = state.assembler.selected.filter((ref) => !(ref.bucket === source && visibleIds.has(ref.id)));
   renderSelectedEvidence();
+  refreshEvidenceButtonStates();
 }
 
 function clearSelectedEvidence() {
   state.assembler.selected = [];
   state.assembler.projectId = state.activeProjectId;
   renderSelectedEvidence();
+  refreshEvidenceButtonStates();
   el("assemblerDetail").innerHTML = "";
 }
 
@@ -1576,8 +2240,10 @@ function addMaterialRef(tabKey, id, item = null) {
   }
   state.assembler.selected.push({ bucket: tabKey, id, item });
   showToast(`Added 1 ${tabLabel(tabKey)} item to Generate Idea.`);
+  refreshEvidenceButtonStates();
   if (!el("assemblerModal").hidden) {
     renderSelectedEvidence();
+    refreshEvidenceButtonStates();
     if (item) renderAssemblerDetail(item);
   }
   return true;
@@ -1606,6 +2272,7 @@ function renderSelectedEvidence() {
         .join("")
     : `<p class="muted">No evidence selected yet.</p>`;
   renderAssemblyContext();
+  refreshEvidenceButtonStates();
 }
 
 function renderAssemblerDetail(item) {
@@ -1768,12 +2435,29 @@ async function pollDetailRefresh() {
 }
 
 function bindEvents() {
-  ["projectModal", "deleteProjectModal", "clearRecordsModal", "detailModal", "assemblerModal", "apiKeysModal"].forEach((modalId) => {
+  ["adminUnlockModal", "projectModal", "deleteProjectModal", "clearRecordsModal", "detailModal", "assemblerModal", "apiKeysModal"].forEach((modalId) => {
     el(modalId).addEventListener("click", (event) => {
       if (event.target === el(modalId)) el(modalId).hidden = true;
     });
   });
   el("newProjectBtn").addEventListener("click", () => openProjectModal("create"));
+  el("systemModeInput").addEventListener("change", () => {
+    if (el("systemModeInput").value === "admin") {
+      if (state.adminAuthenticated) {
+        state.systemMode = "admin";
+        localStorage.setItem("principia.systemMode", "admin");
+        updateSystemModeUI();
+        window.setTimeout(() => renderTabContent({ stable: true }), 0);
+      } else {
+        el("systemModeInput").value = "user";
+        openAdminUnlockModal();
+      }
+      return;
+    }
+    switchToUserMode().catch((error) => showToast(error.message || "Unable to switch mode.", "error"));
+  });
+  el("adminUnlockForm").addEventListener("submit", submitAdminUnlock);
+  el("cancelAdminUnlockBtn").addEventListener("click", closeAdminUnlockModal);
   el("projectForm").addEventListener("submit", submitProject);
   el("cancelProjectModalBtn").addEventListener("click", closeProjectModal);
   el("cancelDeleteProjectBtn").addEventListener("click", closeDeleteProjectModal);
@@ -1891,14 +2575,23 @@ function bindEvents() {
         .catch((error) => alert(error.message || "Unable to extract this work."))
         .finally(() => {
           extractButton.disabled = false;
-          loadTab({ reset: true, preserveScroll: true, silent: true });
+          loadTab({ reset: false, preserveScroll: true, silent: true });
         });
       return;
     }
     await openDetail(row.dataset.tab, row.dataset.id);
   });
   el("reloadTabBtn").addEventListener("click", () => loadTab({ reset: true, preserveScroll: true }));
-  el("moreBtn").addEventListener("click", () => loadTab({ reset: false }));
+  el("moreBtn").addEventListener("click", (event) => {
+    const pageButton = event.target.closest("[data-page-number]");
+    if (pageButton) {
+      loadTab({ page: Number(pageButton.dataset.pageNumber), preserveScroll: true });
+      return;
+    }
+    const button = event.target.closest("[data-page-action]");
+    if (!button) return;
+    loadTab({ reset: false, pageDelta: button.dataset.pageAction === "prev" ? -1 : 1, preserveScroll: true });
+  });
   el("tabSearchInput").addEventListener("input", debounce(() => loadTab({ reset: true, preserveScroll: true }), 250));
   el("tabSortInput").addEventListener("change", () => loadTab({ reset: true, preserveScroll: true }));
   el("modelModeInput").addEventListener("change", () => loadTab({ reset: true, preserveScroll: true }));
@@ -1991,6 +2684,7 @@ function bindEvents() {
     if (event.target.closest("[data-action='remove-selected']")) {
       state.assembler.selected.splice(index, 1);
       renderSelectedEvidence();
+      refreshEvidenceButtonStates();
       return;
     }
     renderAssemblerDetail(state.assembler.selected[index]?.item || {});
@@ -2018,6 +2712,7 @@ async function init() {
   const savedTab = localStorage.getItem("principia.activeTab");
   if (tabs.some((tab) => tab.key === savedTab)) state.activeTab = savedTab;
   bindEvents();
+  await refreshAdminSession();
   await loadProjects(localStorage.getItem("principia.activeProjectId") || "");
   await loadSummary();
   await loadTab({ reset: true, preserveScroll: true });

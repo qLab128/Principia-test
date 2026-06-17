@@ -122,6 +122,13 @@ class Store:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_records_bucket_updated ON records(bucket, updated_at)")
             conn.execute(
                 """
+                CREATE INDEX IF NOT EXISTS idx_records_bucket_canonical_key
+                ON records(bucket, json_extract(payload, '$.canonical_key'))
+                WHERE json_extract(payload, '$.canonical_key') IS NOT NULL
+                """
+            )
+            conn.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_records_membership_field_bucket
                 ON records(
                     json_extract(payload, '$.field_id'),
@@ -335,6 +342,25 @@ class Store:
                 ).fetchall()
                 items.update({row["id"]: json.loads(row["payload"]) for row in rows})
         return [items[item_id] for item_id in ids if item_id in items]
+
+    def find_by_canonical_key(self, bucket: str, canonical_key: str) -> dict[str, Any] | None:
+        if bucket not in BUCKETS:
+            raise KeyError(f"Unknown store bucket: {bucket}")
+        key = str(canonical_key or "")
+        if not key:
+            return None
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT payload FROM records
+                WHERE bucket = ?
+                AND json_extract(payload, '$.canonical_key') = ?
+                ORDER BY updated_at DESC, id DESC
+                LIMIT 1
+                """,
+                (bucket, key),
+            ).fetchone()
+        return json.loads(row["payload"]) if row else None
 
     def list_project_memberships(self, field_id: str, bucket: str | None = None, *, include_hidden: bool = False) -> list[dict[str, Any]]:
         clauses = ["bucket = 'project_memberships'", "json_extract(payload, '$.field_id') = ?"]

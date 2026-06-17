@@ -22,7 +22,7 @@
             N: "\\mathbb{N}",
           },
         },
-        svg: { fontCache: "global", linebreaks: { automatic: true, width: "container" } },
+        svg: { fontCache: "global" },
       };
     </script>
     <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
@@ -39,6 +39,20 @@
         </div>
         <button id="newProjectBtn" type="button" class="primary-btn">New Project</button>
         <div id="projectList" class="project-list" aria-live="polite"></div>
+        <div class="system-mode-panel" aria-label="System mode">
+          <label>
+            <span>System mode</span>
+            <select id="systemModeInput">
+              <option value="user">User mode</option>
+              <option value="admin">Admin mode</option>
+            </select>
+          </label>
+          <p id="systemModeHint">Cloud write controls are hidden in user mode.</p>
+          <div class="system-mode-admin-actions" data-admin-only="true">
+            <a href="/cloud">Open Cloud Library</a>
+            <span>Homepage cards also show Sync Cloud controls.</span>
+          </div>
+        </div>
       </aside>
 
       <section class="workspace">
@@ -130,11 +144,37 @@
               <button id="reloadTabBtn" type="button" class="secondary-btn">Reload</button>
             </div>
             <div id="tabContent" class="tab-content" aria-live="polite"></div>
-            <button id="moreBtn" type="button" class="more-btn" hidden>More</button>
+            <div id="moreBtn" class="pager" hidden>
+              <button type="button" data-page-action="prev">Previous</button>
+              <div id="pageNumbers" class="page-numbers" aria-label="Tab pages"></div>
+              <span id="pageInfo">Page 1</span>
+              <button type="button" data-page-action="next">Next</button>
+            </div>
           </section>
         </section>
       </section>
     </main>
+
+    <section id="adminUnlockModal" class="modal-backdrop" hidden>
+      <form id="adminUnlockForm" class="form-modal admin-unlock-modal" role="dialog" aria-modal="true" aria-labelledby="adminUnlockTitle">
+        <header>
+          <div>
+            <p class="eyebrow">System Mode</p>
+            <h2 id="adminUnlockTitle">Unlock admin mode</h2>
+          </div>
+          <button id="cancelAdminUnlockBtn" type="button" class="secondary-btn">Cancel</button>
+        </header>
+        <p class="muted">Admin mode enables homepage cloud write actions for this local session. The key is verified by the local server and is not stored in browser JavaScript.</p>
+        <label class="full-field">
+          <span>Admin key</span>
+          <input id="adminKeyInput" type="password" autocomplete="current-password" placeholder="Enter local admin key" />
+        </label>
+        <p id="adminUnlockStatus" class="muted" aria-live="polite"></p>
+        <div class="modal-actions">
+          <button id="unlockAdminBtn" type="submit" class="primary-btn">Unlock Admin Mode</button>
+        </div>
+      </form>
+    </section>
 
     <section id="projectModal" class="modal-backdrop" hidden>
       <form id="projectForm" class="form-modal" role="dialog" aria-modal="true" aria-labelledby="projectModalTitle">
@@ -172,7 +212,7 @@
         <p id="deleteProjectMessage" class="muted"></p>
         <label class="checkbox-row">
           <input id="deleteProjectLocalDataInput" type="checkbox" />
-          <span>Also remove local records used only by this project</span>
+          <span>Remove local records used only by this project</span>
         </label>
         <div class="modal-actions">
           <button id="confirmDeleteProjectBtn" type="button" class="danger-btn">Delete Project</button>

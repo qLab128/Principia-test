@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import random
 import hashlib
 import json
@@ -16,13 +17,14 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .arxiv import fallback_seed_work, search_arxiv
+from .cloud.ids import candidate_identity_keys
 from .cloud.resolver import CloudResolver
 from .global_store import GlobalStore, LEGACY_CONCEPT_BUCKETS
 from .hybrid_retriever import HybridRetriever
 from .lineage_graph import LineageGraphBuilder
 from .llm_client import LLMClient
 from .migration_demo_to_v1 import DemoToV1Migration
-from .research_sources import fetch_transient_full_text, search_hybrid_sources
+from .research_sources import fetch_transient_full_text, recover_missing_abstract, search_hybrid_sources
 from .models import (
     AssistantExport,
     BaselineRecord,
@@ -58,7 +60,7 @@ from .utils import (
     tokenize,
     validation_number,
 )
-from .work_versioning import model_key as build_model_key
+from .work_versioning import model_key as build_model_key, normalize_title
 
 
 OPERATORS = [
@@ -252,6 +254,7 @@ class PrincipiaEngine:
         model_mode: str = "auto",
         target_works: int = 100,
         run_id: str = "",
+        force_refresh: bool = False,
     ) -> dict[str, Any]:
         result = self.v2_research_project(
             field_id,
@@ -259,6 +262,7 @@ class PrincipiaEngine:
             model_mode=model_mode,
             target_works=target_works,
             run_id=run_id,
+            force_refresh=force_refresh,
         )
         if not result.get("ok"):
             return {**result, "v1_migration": {"skipped": True}}
@@ -1335,6 +1339,8 @@ class PrincipiaEngine:
                     self.store.delete_item("evidence_links", link["link_id"])
                     deleted_records["evidence_links"] = deleted_records.get("evidence_links", 0) + 1
         self.store.delete_item("field_profiles", field_id)
+        if delete_orphan_records:
+            self.compact_local_storage(clear_cloud_cache=False)
         return {"ok": True, "deleted": field_id, "deleted_records": deleted_records}
 
     def cleanup_local_records(self) -> dict[str, Any]:
@@ -1624,6 +1630,133 @@ class PrincipiaEngine:
         self.store.vacuum()
         self.global_store.vacuum()
         return {"ok": True, "deleted": deleted}
+
+    def compact_local_storage(self, *, clear_cloud_cache: bool = True) -> dict[str, Any]:
+        before = self._local_storage_sizes()
+        data = self.store.snapshot(limit_per_bucket=None)
+        active_project_ids = {
+            str(project_id)
+            for project_id, project in data.get("field_profiles", {}).items()
+            if project_id != "default" and not project.get("archived")
+        }
+        active_project_ids.add("cloud-crawl")
+        kept: dict[str, set[str]] = {bucket: set() for bucket in BUCKETS}
+        kept["field_profiles"].update(str(project_id) for project_id in data.get("field_profiles", {}))
+        kept_work_ids: set[str] = set()
+        for profile_id, profile in data.get("field_profiles", {}).items():
+            if profile_id == "default" or str(profile_id) in active_project_ids:
+                kept["source_works"].update(str(item) for item in profile.get("work_ids", []) if item)
+                kept["principles"].update(str(item) for item in profile.get("principle_ids", []) if item)
+                kept["my_ideas"].update(str(item) for item in profile.get("idea_ids", []) if item)
+        stale_memberships: list[str] = []
+        for membership_id, membership in data.get("project_memberships", {}).items():
+            field_id = str(membership.get("field_id") or "")
+            bucket = str(membership.get("bucket") or "")
+            record_id = str(membership.get("record_id") or "")
+            if not field_id or field_id not in active_project_ids:
+                stale_memberships.append(membership_id)
+                continue
+            if bucket in kept and record_id:
+                kept["project_memberships"].add(membership_id)
+                kept[bucket].add(record_id)
+                if bucket == "source_works":
+                    kept_work_ids.add(record_id)
+        kept_work_ids.update(kept.get("source_works", set()))
+        concept_buckets = ("existed_ideas", "principles", "takeaway_messages", "benchmark_records", "baseline_records")
+        changed = True
+        while changed:
+            changed = False
+            for bucket in concept_buckets:
+                id_key = self._record_id_key(bucket)
+                for record_id, item in data.get(bucket, {}).items():
+                    if record_id in kept[bucket]:
+                        continue
+                    linked_work_ids = set(self._cloud_record_work_ids(bucket, item))
+                    if linked_work_ids & kept_work_ids:
+                        kept[bucket].add(str(item.get(id_key) or item.get("canonical_id") or record_id))
+                        changed = True
+            for link_id, link in data.get("evidence_links", {}).items():
+                source_id = str(link.get("source_id") or "")
+                target_bucket = str(link.get("target_bucket") or "")
+                target_id = str(link.get("target_id") or "")
+                if source_id in kept_work_ids and target_bucket in kept and target_id in kept[target_bucket]:
+                    if link_id not in kept["evidence_links"]:
+                        kept["evidence_links"].add(link_id)
+                        changed = True
+        for record_id, item in data.get("result_records", {}).items():
+            source_id = str(item.get("source_work_id") or item.get("work_id") or "")
+            if source_id in kept_work_ids:
+                kept["result_records"].add(record_id)
+        for run_id, run in data.get("research_runs", {}).items():
+            if str(run.get("field_id") or "") in active_project_ids:
+                kept["research_runs"].add(run_id)
+        deleted: dict[str, int] = {}
+        for membership_id in stale_memberships:
+            if self.store.get_item("project_memberships", membership_id):
+                self.store.delete_item("project_memberships", membership_id)
+                deleted["project_memberships"] = deleted.get("project_memberships", 0) + 1
+        purge_buckets = (
+            "source_works",
+            "existed_ideas",
+            "principles",
+            "takeaway_messages",
+            "benchmark_records",
+            "baseline_records",
+            "result_records",
+            "work_facts",
+            "my_ideas",
+            "gap_cards",
+            "evidence_links",
+            "research_runs",
+        )
+        for bucket in purge_buckets:
+            id_key = self._record_id_key(bucket)
+            for record_id, item in list(data.get(bucket, {}).items()):
+                actual_id = str(item.get(id_key) or item.get("canonical_id") or record_id)
+                if actual_id in kept.get(bucket, set()) or record_id in kept.get(bucket, set()):
+                    continue
+                self.store.delete_item(bucket, record_id)
+                deleted[bucket] = deleted.get(bucket, 0) + 1
+        cloud_cache_deleted = self._clear_cloud_cache_tables() if clear_cloud_cache else {}
+        self.store.vacuum()
+        self.global_store.vacuum()
+        after = self._local_storage_sizes()
+        return {
+            "ok": True,
+            "deleted": deleted,
+            "cloud_cache_deleted": cloud_cache_deleted,
+            "sizes_before": before,
+            "sizes_after": after,
+            "bytes_reclaimed": max(0, int(before.get("total_bytes", 0)) - int(after.get("total_bytes", 0))),
+        }
+
+    def _local_storage_sizes(self) -> dict[str, int]:
+        paths = [self.store.path, self.store.path.with_suffix(self.store.path.suffix + "-wal"), self.store.path.with_suffix(self.store.path.suffix + "-shm")]
+        sizes = {path.name: int(path.stat().st_size) for path in paths if path.exists()}
+        sizes["total_bytes"] = sum(sizes.values())
+        return sizes
+
+    def _clear_cloud_cache_tables(self) -> dict[str, int]:
+        tables = (
+            "cloud_manifest_cache",
+            "cloud_asset_cache",
+            "cloud_route_shard_cache",
+            "cloud_resolution_cache",
+            "cloud_payload_cache",
+        )
+        deleted: dict[str, int] = {}
+        with self.store._lock, self.store._connect() as conn:
+            existing_tables = {
+                str(row["name"])
+                for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            for table in tables:
+                if table not in existing_tables:
+                    continue
+                cursor = conn.execute(f"DELETE FROM {table}")
+                deleted[table] = int(cursor.rowcount or 0)
+            self.store._touch_meta(conn)
+        return deleted
 
     def _clear_v1_memory(self) -> dict[str, int]:
         deleted: dict[str, int] = {}
@@ -2110,6 +2243,7 @@ class PrincipiaEngine:
         model_mode: str = "auto",
         target_works: int = 100,
         run_id: str = "",
+        force_refresh: bool = False,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         target_works = max(1, min(int(target_works or 100), 200))
@@ -2165,30 +2299,83 @@ class PrincipiaEngine:
             profile["updated_at"] = utc_now()
             self.store.upsert("field_profiles", profile, "field_id")
 
-            update("query_planning", "Planning hybrid academic/web queries.")
-            search_goal = self._v2_english_search_goal(goal_text, model_mode=model_mode)
-            if search_goal.strip() and search_goal.strip() != goal_text.strip():
-                update("query_planning", "Translated the research goal into an English academic search query.", translated_query=search_goal)
-            query = self._v2_research_query(search_goal or goal_text)
-            update("source_search", "Searching arXiv, OpenAlex, Crossref, and public metadata.", planned_query=query)
-            works = search_hybrid_sources(query, max_results=target_works, timeout=12)
-            self._raise_if_cancelled(run_id)
-            broaden_query = search_goal or goal_text
-            if len(works) < target_works and broaden_query.strip() and broaden_query.strip() != query.strip():
+            existing_project_works = self._rank_works_for_query(goal_text, self._v2_project_records_fast(field_id, "source_works"))
+            existing_work_count = len(existing_project_works)
+            search_goal = goal_text
+            if existing_work_count >= target_works:
+                works = existing_project_works
                 update(
-                    "source_search_broaden",
-                    f"Found {len(works)}/{target_works} works; broadening metadata search with the original query.",
-                    found_works=len(works),
+                    "existing_works_research",
+                    (
+                        f"Found {existing_work_count} works already in the project; "
+                        "skipping metadata search and researching works without current extraction."
+                    ),
+                    found_works=existing_work_count,
+                    existing_works=existing_work_count,
                     target_works=target_works,
                 )
-                more_works = search_hybrid_sources(broaden_query, max_results=target_works, timeout=12)
-                works = self._dedupe_works([*works, *more_works])
+            else:
+                top_up_needed = target_works - existing_work_count
+                update(
+                    "query_planning",
+                    f"Project has {existing_work_count}/{target_works} works; planning search to add {top_up_needed} more.",
+                    existing_works=existing_work_count,
+                    top_up_needed=top_up_needed,
+                    target_works=target_works,
+                )
+                update(
+                    "query_translation",
+                    "Preparing an English academic search query before metadata search.",
+                    existing_works=existing_work_count,
+                    top_up_needed=top_up_needed,
+                    target_works=target_works,
+                )
+                search_goal = self._v2_english_search_goal(goal_text, model_mode=model_mode)
+                if search_goal.strip() and search_goal.strip() != goal_text.strip():
+                    update("query_planning", "Translated the research goal into an English academic search query.", translated_query=search_goal)
+                query = self._v2_research_query(search_goal or goal_text)
+                update(
+                    "source_search",
+                    "Searching arXiv, OpenAlex, Crossref, and public metadata to fill the Works target.",
+                    planned_query=query,
+                    existing_works=existing_work_count,
+                    top_up_needed=top_up_needed,
+                )
+                found_works = search_hybrid_sources(query, max_results=target_works, timeout=12)
                 self._raise_if_cancelled(run_id)
-            if len(works) < min(8, target_works):
-                works = self._dedupe_works([*works, *fallback_seed_work(search_goal or goal_text)])[:target_works]
-            works = self._rank_works_for_query(f"{goal_text} {search_goal}", works)[:target_works]
+                update(
+                    "source_search",
+                    f"Found {len(found_works)} raw source candidate(s); de-duplicating and ranking them.",
+                    source_candidates=len(found_works),
+                    existing_works=existing_work_count,
+                    target_works=target_works,
+                )
+                combined_works = self._dedupe_works([*existing_project_works, *found_works])
+                broaden_query = search_goal or goal_text
+                if len(combined_works) < target_works and broaden_query.strip() and broaden_query.strip() != query.strip():
+                    update(
+                        "source_search_broaden",
+                        f"Found {len(combined_works)}/{target_works} works after de-duplication; broadening metadata search with the original query.",
+                        found_works=len(combined_works),
+                        existing_works=existing_work_count,
+                        target_works=target_works,
+                    )
+                    more_works = search_hybrid_sources(broaden_query, max_results=target_works, timeout=12)
+                    combined_works = self._dedupe_works([*combined_works, *more_works])
+                    self._raise_if_cancelled(run_id)
+                    update(
+                        "source_search_broaden",
+                        f"Broad search returned {len(combined_works)} de-duplicated candidate work(s).",
+                        found_works=len(combined_works),
+                        existing_works=existing_work_count,
+                        target_works=target_works,
+                    )
+                if len(combined_works) < min(8, target_works):
+                    combined_works = self._dedupe_works([*combined_works, *fallback_seed_work(search_goal or goal_text)])
+                ranked_new_works = self._rank_works_for_query(f"{goal_text} {search_goal}", found_works)
+                works = self._dedupe_works([*existing_project_works, *ranked_new_works, *combined_works])[:target_works]
             if len(works) < target_works:
-                warning = f"Public metadata returned {len(works)} relevant works, below the requested target of {target_works}."
+                warning = f"Project has {len(works)} works after search/top-up, below the requested target of {target_works}."
                 run["warnings"] = self._ordered_unique([*run.get("warnings", []), warning])
                 update("source_search_warning", warning, found_works=len(works), target_works=target_works)
             work_ids: list[str] = []
@@ -2199,59 +2386,136 @@ class PrincipiaEngine:
             baseline_ids: list[str] = []
             result_ids: list[str] = []
             evidence_links: list[dict[str, Any]] = []
-            llm_candidate_pool = self._v2_select_extraction_works(goal_text, works, model_mode=model_mode, target_works=target_works)
-            llm_candidates = [work for work in llm_candidate_pool if self._v2_needs_llm_extraction(work, model_mode)]
-            skipped_unchanged = max(0, len(llm_candidate_pool) - len(llm_candidates))
-
-            stored_lookup: dict[str, dict[str, Any]] = {}
-            for index, raw_work in enumerate(works, start=1):
-                self._raise_if_cancelled(run_id)
-                work = self._v2_upsert_work(raw_work, model_mode="metadata")
-                work_ids.append(work["work_id"])
-                stored_lookup[str(raw_work.get("work_id") or work["work_id"])] = work
-                stored_lookup[work["work_id"]] = work
-                if index % 25 == 0 or index == len(works):
+            cloud_hits_by_candidate: dict[str, dict[str, Any]] = {}
+            if not force_refresh:
+                try:
                     update(
-                        "works_stored",
-                        f"Stored {index}/{len(works)} relevant works before LLM extraction.",
+                        "cloud_lookup",
+                        "Checking candidate works against the Principia Cloud Library before LLM extraction.",
                         found_works=len(works),
-                        stored_works=len(set(work_ids)),
                         target_works=target_works,
                     )
+                    decisions = CloudResolver(self.store).resolve_batch(
+                        works,
+                        self._cloud_model_key(model_mode),
+                        hydrate=True,
+                        project_id=field_id,
+                    )
+                    for decision in decisions:
+                        if decision.get("should_extract"):
+                            continue
+                        candidate_id = str(decision.get("candidate_work_id") or "")
+                        if candidate_id:
+                            cloud_hits_by_candidate[candidate_id] = decision
+                    if cloud_hits_by_candidate:
+                        update(
+                            "cloud_hydration",
+                            f"Loaded {len(cloud_hits_by_candidate)} candidate paper(s) from Cloud DB; matching LLM extraction will be skipped.",
+                            cloud_hits=len(cloud_hits_by_candidate),
+                            found_works=len(works),
+                        )
+                except Exception as exc:
+                    update(
+                        "cloud_lookup_skipped",
+                        f"Cloud lookup was skipped and local extraction will continue: {exc}",
+                        found_works=len(works),
+                    )
+            update(
+                "works_storing",
+                f"Saving {len(works)} matched works locally before extraction.",
+                found_works=len(works),
+                stored_works=0,
+                target_works=target_works,
+            )
+            prepared_works = self._v2_prepare_research_works_batch(
+                works,
+                cloud_hits_by_candidate=cloud_hits_by_candidate,
+                model_mode="metadata",
+            )
+            self._raise_if_cancelled(run_id)
+            work_ids = [str(work.get("work_id") or "") for work in prepared_works if str(work.get("work_id") or "")]
+            update(
+                "works_stored",
+                f"Saved {len(set(work_ids))}/{len(works)} matched works locally before extraction.",
+                found_works=len(works),
+                stored_works=len(set(work_ids)),
+                target_works=target_works,
+            )
             self.add_project_memberships(field_id, "source_works", self._ordered_unique(work_ids), source="v2_research", prepend=True)
             profile = self.store.get_item("field_profiles", field_id) or profile
             profile["work_ids"] = self._ordered_unique([*(profile.get("work_ids") or []), *work_ids])
             profile["updated_at"] = utc_now()
             self.store.upsert("field_profiles", profile, "field_id")
+            works = prepared_works
 
-            llm_candidates = self._v2_attach_transient_full_text(llm_candidates, run_id=run_id, progress_callback=update)
-            llm_candidate_ids = {str(work.get("work_id") or "") for work in llm_candidates}
-            benchmark_signal_works = [
-                work
-                for work in self._rank_works_for_query(goal_text, works)
-                if str(work.get("work_id") or "") not in llm_candidate_ids
-                and self._contains_any(f"{work.get('title', '')} {work.get('abstract', '')}", self._benchmark_signal_terms())
-            ][: min(12, max(4, target_works // 8))]
-            benchmark_signal_works = self._v2_attach_transient_full_text(
-                benchmark_signal_works,
-                run_id=run_id,
-                progress_callback=update,
+            ranked_works = self._rank_works_for_query(goal_text, works)
+            extraction_count_map = self._v2_work_extraction_count_map(
+                [str(work.get("work_id") or "") for work in ranked_works],
+                model_mode=model_mode,
             )
-            extraction_candidates = self._dedupe_works([*llm_candidates, *benchmark_signal_works])
-            extraction_lookup = {str(work.get("work_id") or ""): work for work in extraction_candidates}
-            work_lookup = {str(work.get("work_id") or ""): work for work in [*works, *extraction_candidates]}
+            llm_candidate_pool = ranked_works if force_refresh else [
+                work
+                for work in ranked_works
+                if self._v2_work_needs_research(work, model_mode, count_map=extraction_count_map)
+            ]
+            llm_candidates = list(llm_candidate_pool)
+            llm_candidate_ids = {str(item.get("work_id") or "") for item in llm_candidates}
+            skipped_unchanged = 0 if force_refresh else max(0, len(works) - len(llm_candidate_pool))
+            reused_candidates = [] if force_refresh else [
+                work
+                for work in ranked_works
+                if str(work.get("work_id") or "") not in llm_candidate_ids
+            ]
+            for work in reused_candidates:
+                linked = self._v2_add_existing_extractions_to_project(
+                    field_id,
+                    str(work.get("work_id") or ""),
+                    model_mode=model_mode,
+                    source="cloud_or_local_reuse",
+                )
+                existed_ids.extend(linked.get("existed_ideas") or [])
+                principle_ids.extend(linked.get("principles") or [])
+                message_ids.extend(linked.get("takeaway_messages") or [])
+                benchmark_ids.extend(linked.get("benchmark_records") or [])
+                baseline_ids.extend(linked.get("baseline_records") or [])
+                result_ids.extend(linked.get("result_records") or [])
+            update(
+                "research_candidate_selection",
+                (
+                    f"Selected {len(llm_candidate_pool)} unresearched work(s) for extraction; "
+                    f"{skipped_unchanged} already have current extraction."
+                ),
+                found_works=len(works),
+                unresearched_works=len(llm_candidate_pool),
+                skipped_unchanged_llm=skipped_unchanged,
+                already_researched_works=skipped_unchanged,
+                target_works=target_works,
+            )
 
-            def persist_deterministic_full_text_records() -> None:
-                full_text_candidates = [work for work in extraction_candidates if work.get("transient_full_text")]
+            goal = self._observatory_goal(goal_text)
+            llm_extras: dict[str, dict[str, Any]] = {}
+            full_text_batch_size = 10
+            total_batches = (len(llm_candidates) + full_text_batch_size - 1) // full_text_batch_size if llm_candidates else 0
+            processed_structured = 0
+            seen_llm_warnings: set[str] = set()
+
+            def persist_deterministic_full_text_records(
+                batch_candidates: list[dict[str, Any]],
+                *,
+                batch_llm_candidate_ids: set[str],
+                batch_index: int,
+            ) -> None:
+                full_text_candidates = [work for work in batch_candidates if work.get("transient_full_text")]
                 if not full_text_candidates:
                     return
                 update(
                     "deterministic_full_text_extraction",
-                    f"Extracting explicit records from {len(full_text_candidates)} fetched full-text works before slow LLM batches.",
+                    f"Extracting explicit records from batch {batch_index}/{total_batches} before slow LLM extraction.",
                     deterministic_done=0,
                     deterministic_total=len(full_text_candidates),
+                    research_batch=batch_index,
+                    research_batches_total=total_batches,
                 )
-                goal = self._observatory_goal(goal_text)
                 for det_index, raw_work in enumerate(full_text_candidates, start=1):
                     self._raise_if_cancelled(run_id)
                     work = self._v2_upsert_work(raw_work, model_mode=model_mode)
@@ -2264,23 +2528,6 @@ class PrincipiaEngine:
                     work_message_ids: list[str] = []
                     work_benchmark_ids: list[str] = []
                     work_baseline_ids: list[str] = []
-                    if str(raw_work.get("work_id") or "") in llm_candidate_ids:
-                        extracted = self._v2_extract_concepts_from_work(goal_text, concept_work, {})
-                        for payload in extracted["existed_ideas"]:
-                            item = self._v2_upsert_canonical("existed_ideas", payload["idea_text"], payload, model_mode=model_mode)
-                            existed_ids.append(item["canonical_id"])
-                            work_existed_ids.append(item["canonical_id"])
-                            work_links.append(self._v2_evidence_link(field_id, "existed_ideas", item["canonical_id"], work["work_id"], payload.get("evidence", "")))
-                        for payload in extracted["principles"]:
-                            item = self._v2_upsert_canonical("principles", payload["name"], payload, model_mode=model_mode)
-                            principle_ids.append(item["principle_id"])
-                            work_principle_ids.append(item["principle_id"])
-                            work_links.append(self._v2_evidence_link(field_id, "principles", item["principle_id"], work["work_id"], payload.get("evidence", "")))
-                        for payload in extracted["takeaway_messages"]:
-                            item = self._v2_upsert_canonical("takeaway_messages", payload["message_text"], payload, model_mode=model_mode)
-                            message_ids.append(item["canonical_id"])
-                            work_message_ids.append(item["canonical_id"])
-                            work_links.append(self._v2_evidence_link(field_id, "takeaway_messages", item["canonical_id"], work["work_id"], payload.get("evidence", "")))
                     matrix = self.extract_benchmark_records(goal, concept_work, field_id=field_id, persist=False)
                     for benchmark in matrix.get("benchmark_records", []):
                         payload = self._v2_benchmark_payload(benchmark, work)
@@ -2320,6 +2567,8 @@ class PrincipiaEngine:
                         f"Stored explicit full-text records from {det_index}/{len(full_text_candidates)} works.",
                         deterministic_done=det_index,
                         deterministic_total=len(full_text_candidates),
+                        research_batch=batch_index,
+                        research_batches_total=total_batches,
                         existed_ideas=len(set(existed_ids)),
                         principles=len(set(principle_ids)),
                         takeaway_messages=len(set(message_ids)),
@@ -2327,16 +2576,14 @@ class PrincipiaEngine:
                         baselines=len(set(baseline_ids)),
                     )
 
-            persist_deterministic_full_text_records()
-
-            def persist_llm_concepts(batch_extras: dict[str, dict[str, Any]]) -> None:
+            def persist_llm_concepts(batch_extras: dict[str, dict[str, Any]], batch_work_lookup: dict[str, dict[str, Any]]) -> None:
                 batch_links: list[dict[str, Any]] = []
                 batch_work_ids: list[str] = []
                 batch_existed: list[str] = []
                 batch_principles: list[str] = []
                 batch_messages: list[str] = []
                 for raw_work_id, extras in batch_extras.items():
-                    raw_work = work_lookup.get(str(raw_work_id))
+                    raw_work = batch_work_lookup.get(str(raw_work_id))
                     if not raw_work or not extras:
                         continue
                     work = self._v2_upsert_work(raw_work, model_mode=model_mode)
@@ -2371,10 +2618,132 @@ class PrincipiaEngine:
                         "llm_extraction_persist",
                         "Stored the latest extracted ideas, principles, and takeaway messages.",
                         found_works=len(works),
-                        llm_extracted_works=len(set(work_ids)),
+                        llm_extracted_works=len(set([*llm_extras.keys(), *batch_extras.keys()])),
                         existed_ideas=len(set(existed_ids)),
                         principles=len(set(principle_ids)),
                         takeaway_messages=len(set(message_ids)),
+                    )
+
+            def persist_structured_records(
+                structured_raw_works: list[dict[str, Any]],
+                extraction_lookup: dict[str, dict[str, Any]],
+                batch_llm_extras: dict[str, dict[str, Any]],
+                *,
+                batch_index: int,
+            ) -> None:
+                nonlocal processed_structured
+                for raw_work in structured_raw_works:
+                    self._raise_if_cancelled(run_id)
+                    processed_structured += 1
+                    extraction_raw = extraction_lookup.get(str(raw_work.get("work_id") or "")) or raw_work
+                    work = self._v2_upsert_work(extraction_raw, model_mode=model_mode)
+                    work_ids.append(work["work_id"])
+                    work_links: list[dict[str, Any]] = []
+                    work_existed_ids: list[str] = []
+                    work_principle_ids: list[str] = []
+                    work_message_ids: list[str] = []
+                    work_benchmark_ids: list[str] = []
+                    work_baseline_ids: list[str] = []
+                    extras = batch_llm_extras.get(raw_work.get("work_id", "")) or batch_llm_extras.get(work.get("work_id", "")) or {}
+                    concept_work = {**work, "transient_full_text": extraction_raw.get("transient_full_text", "")}
+                    extracted = self._v2_extract_concepts_from_work(goal_text, concept_work, extras)
+                    for payload in extracted["existed_ideas"]:
+                        item = self._v2_upsert_canonical("existed_ideas", payload["idea_text"], payload, model_mode=model_mode)
+                        existed_ids.append(item["canonical_id"])
+                        work_existed_ids.append(item["canonical_id"])
+                        link = self._v2_evidence_link(field_id, "existed_ideas", item["canonical_id"], work["work_id"], payload.get("evidence", ""))
+                        evidence_links.append(link)
+                        work_links.append(link)
+                    for payload in extracted["principles"]:
+                        item = self._v2_upsert_canonical("principles", payload["name"], payload, model_mode=model_mode)
+                        principle_ids.append(item["principle_id"])
+                        work_principle_ids.append(item["principle_id"])
+                        link = self._v2_evidence_link(field_id, "principles", item["principle_id"], work["work_id"], payload.get("evidence", ""))
+                        evidence_links.append(link)
+                        work_links.append(link)
+                    for payload in extracted["takeaway_messages"]:
+                        item = self._v2_upsert_canonical("takeaway_messages", payload["message_text"], payload, model_mode=model_mode)
+                        message_ids.append(item["canonical_id"])
+                        work_message_ids.append(item["canonical_id"])
+                        link = self._v2_evidence_link(field_id, "takeaway_messages", item["canonical_id"], work["work_id"], payload.get("evidence", ""))
+                        evidence_links.append(link)
+                        work_links.append(link)
+                    matrix = self.extract_benchmark_records(goal, concept_work, field_id=field_id, persist=False)
+                    for benchmark in matrix.get("benchmark_records", []):
+                        payload = self._v2_benchmark_payload(benchmark, work)
+                        item = self._v2_upsert_canonical("benchmark_records", payload["benchmark_name"], payload, model_mode=model_mode)
+                        benchmark_ids.append(item["benchmark_id"])
+                        work_benchmark_ids.append(item["benchmark_id"])
+                        link = self._v2_evidence_link(field_id, "benchmark_records", item["benchmark_id"], work["work_id"], payload.get("evidence", ""))
+                        evidence_links.append(link)
+                        work_links.append(link)
+                    for benchmark in extras.get("benchmarks", []) or []:
+                        if not isinstance(benchmark, dict):
+                            continue
+                        payload = self._v2_benchmark_payload(benchmark, work)
+                        if not payload.get("benchmark_name") or payload.get("benchmark_name") == "Unspecified benchmark":
+                            continue
+                        item = self._v2_upsert_canonical("benchmark_records", payload["benchmark_name"], payload, model_mode=model_mode)
+                        benchmark_ids.append(item["benchmark_id"])
+                        work_benchmark_ids.append(item["benchmark_id"])
+                        link = self._v2_evidence_link(field_id, "benchmark_records", item["benchmark_id"], work["work_id"], payload.get("evidence", ""))
+                        evidence_links.append(link)
+                        work_links.append(link)
+                    for baseline in matrix.get("baseline_records", []):
+                        related_results = [
+                            result
+                            for result in matrix.get("result_records", [])
+                            if result.get("baseline_id") == baseline.get("baseline_id") or result.get("benchmark_id") == baseline.get("benchmark_id")
+                        ]
+                        payload = self._v2_baseline_payload(baseline, work, related_results)
+                        if not self._is_supported_baseline_record(payload, work, related_results):
+                            continue
+                        item = self._v2_upsert_canonical("baseline_records", payload["baseline_name"], payload, model_mode=model_mode)
+                        baseline_ids.append(item["baseline_id"])
+                        work_baseline_ids.append(item["baseline_id"])
+                        link = self._v2_evidence_link(field_id, "baseline_records", item["baseline_id"], work["work_id"], payload.get("evidence", ""))
+                        evidence_links.append(link)
+                        work_links.append(link)
+                    for baseline in extras.get("baselines", []) or []:
+                        if not isinstance(baseline, dict):
+                            continue
+                        payload = self._v2_baseline_payload(baseline, work, list(baseline.get("performance") or []))
+                        if not payload.get("baseline_name") or payload.get("baseline_name") == "Baseline":
+                            continue
+                        if not self._is_supported_baseline_record(payload, work, list(baseline.get("performance") or [])):
+                            continue
+                        item = self._v2_upsert_canonical("baseline_records", payload["baseline_name"], payload, model_mode=model_mode)
+                        baseline_ids.append(item["baseline_id"])
+                        work_baseline_ids.append(item["baseline_id"])
+                        link = self._v2_evidence_link(field_id, "baseline_records", item["baseline_id"], work["work_id"], payload.get("evidence", ""))
+                        evidence_links.append(link)
+                        work_links.append(link)
+                    for result in matrix.get("result_records", []):
+                        result = dict(result)
+                        result.setdefault("source_work_id", work["work_id"])
+                        result_ids.append(result["result_id"])
+                        self.store.upsert("result_records", result, "result_id")
+                    if work_links:
+                        self.store.upsert_many("evidence_links", work_links, "link_id")
+                    self.add_project_memberships(field_id, "source_works", [work["work_id"]], source="v2_research", prepend=True)
+                    self.add_project_memberships(field_id, "existed_ideas", self._ordered_unique(work_existed_ids), source="v2_research", prepend=True)
+                    self.add_project_memberships(field_id, "principles", self._ordered_unique(work_principle_ids), source="v2_research")
+                    self.add_project_memberships(field_id, "takeaway_messages", self._ordered_unique(work_message_ids), source="v2_research")
+                    self.add_project_memberships(field_id, "benchmark_records", self._ordered_unique(work_benchmark_ids), source="v2_research")
+                    self.add_project_memberships(field_id, "baseline_records", self._ordered_unique(work_baseline_ids), source="v2_research")
+                    update(
+                        "structured_extraction",
+                        f"Extracted structured evidence from batch {batch_index}/{total_batches}; processed {processed_structured}/{len(llm_candidate_pool)} unresearched works.",
+                        processed_works=processed_structured,
+                        structured_works_total=len(llm_candidate_pool),
+                        research_batch=batch_index,
+                        research_batches_total=total_batches,
+                        found_works=len(works),
+                        existed_ideas=len(set(existed_ids)),
+                        principles=len(set(principle_ids)),
+                        takeaway_messages=len(set(message_ids)),
+                        benchmarks=len(set(benchmark_ids)),
+                        baselines=len(set(baseline_ids)),
                     )
 
             if skipped_unchanged:
@@ -2383,165 +2752,103 @@ class PrincipiaEngine:
                     f"Skipped {skipped_unchanged} unchanged works for the same LLM.",
                     found_works=len(works),
                     skipped_unchanged_llm=skipped_unchanged,
+                    already_researched_works=skipped_unchanged,
                 )
-            llm_extras = self._v2_llm_extract_batch(
-                goal_text,
-                llm_candidates,
-                model_mode=model_mode,
-                progress_callback=update,
-                batch_result_callback=persist_llm_concepts,
-                cancel_check=lambda: self._is_run_cancelled(run_id),
-            )
-            self._raise_if_cancelled(run_id)
-            llm_extract_error = str(getattr(self, "_last_v2_llm_extract_error", "") or "")
-            if llm_extract_error:
-                run["warnings"] = self._ordered_unique([*run.get("warnings", []), llm_extract_error])
-                update("llm_extraction_warning", llm_extract_error)
-            update(
-                "work_upsert",
-                f"Storing {len(works)} candidate works.",
-                found_works=len(works),
-                llm_extracted_works=len(llm_extras),
-                skipped_unchanged_llm=skipped_unchanged,
-            )
-            goal = self._observatory_goal(goal_text)
-            structured_work_ids = {
-                str(work.get("work_id") or "")
-                for work in [*llm_candidate_pool, *llm_candidates]
-                if work.get("work_id")
-            }
-            structured_work_ids.update(str(work_id) for work_id in llm_extras if work_id)
-            structured_raw_works: list[dict[str, Any]] = []
-            seen_structured_ids: set[str] = set()
-            for raw_work in works:
-                raw_work_id = str(raw_work.get("work_id") or "")
-                if raw_work_id not in structured_work_ids or raw_work_id in seen_structured_ids:
-                    continue
-                structured_raw_works.append(raw_work)
-                seen_structured_ids.add(raw_work_id)
-            for raw_work_id, raw_work in extraction_lookup.items():
-                if raw_work_id and raw_work_id in structured_work_ids and raw_work_id not in seen_structured_ids:
-                    structured_raw_works.append(raw_work)
-                    seen_structured_ids.add(raw_work_id)
-            if not structured_raw_works:
-                structured_raw_works = self._rank_works_for_query(goal_text, works)[: min(len(works), 6)]
-            update(
-                "structured_extraction",
-                f"Extracting structured evidence from {len(structured_raw_works)} selected works; {len(works)} works are already stored.",
-                processed_works=0,
-                structured_works_total=len(structured_raw_works),
-                found_works=len(works),
-                existed_ideas=len(set(existed_ids)),
-                principles=len(set(principle_ids)),
-                takeaway_messages=len(set(message_ids)),
-                benchmarks=len(set(benchmark_ids)),
-                baselines=len(set(baseline_ids)),
-            )
-            for index, raw_work in enumerate(structured_raw_works, start=1):
-                self._raise_if_cancelled(run_id)
-                extraction_raw = extraction_lookup.get(str(raw_work.get("work_id") or "")) or raw_work
-                work = self._v2_upsert_work(extraction_raw, model_mode=model_mode)
-                work_ids.append(work["work_id"])
-                work_links: list[dict[str, Any]] = []
-                work_existed_ids: list[str] = []
-                work_principle_ids: list[str] = []
-                work_message_ids: list[str] = []
-                work_benchmark_ids: list[str] = []
-                work_baseline_ids: list[str] = []
-                extras = llm_extras.get(raw_work.get("work_id", "")) or llm_extras.get(work.get("work_id", "")) or {}
-                concept_work = {**work, "transient_full_text": extraction_raw.get("transient_full_text", "")}
-                extracted = self._v2_extract_concepts_from_work(goal_text, concept_work, extras)
-                for payload in extracted["existed_ideas"]:
-                    item = self._v2_upsert_canonical("existed_ideas", payload["idea_text"], payload, model_mode=model_mode)
-                    existed_ids.append(item["canonical_id"])
-                    work_existed_ids.append(item["canonical_id"])
-                    link = self._v2_evidence_link(field_id, "existed_ideas", item["canonical_id"], work["work_id"], payload.get("evidence", ""))
-                    evidence_links.append(link)
-                    work_links.append(link)
-                for payload in extracted["principles"]:
-                    item = self._v2_upsert_canonical("principles", payload["name"], payload, model_mode=model_mode)
-                    principle_ids.append(item["principle_id"])
-                    work_principle_ids.append(item["principle_id"])
-                    link = self._v2_evidence_link(field_id, "principles", item["principle_id"], work["work_id"], payload.get("evidence", ""))
-                    evidence_links.append(link)
-                    work_links.append(link)
-                for payload in extracted["takeaway_messages"]:
-                    item = self._v2_upsert_canonical("takeaway_messages", payload["message_text"], payload, model_mode=model_mode)
-                    message_ids.append(item["canonical_id"])
-                    work_message_ids.append(item["canonical_id"])
-                    link = self._v2_evidence_link(field_id, "takeaway_messages", item["canonical_id"], work["work_id"], payload.get("evidence", ""))
-                    evidence_links.append(link)
-                    work_links.append(link)
-                matrix = self.extract_benchmark_records(goal, concept_work, field_id=field_id, persist=False)
-                for benchmark in matrix.get("benchmark_records", []):
-                    payload = self._v2_benchmark_payload(benchmark, work)
-                    item = self._v2_upsert_canonical("benchmark_records", payload["benchmark_name"], payload, model_mode=model_mode)
-                    benchmark_ids.append(item["benchmark_id"])
-                    work_benchmark_ids.append(item["benchmark_id"])
-                    link = self._v2_evidence_link(field_id, "benchmark_records", item["benchmark_id"], work["work_id"], payload.get("evidence", ""))
-                    evidence_links.append(link)
-                    work_links.append(link)
-                for benchmark in extras.get("benchmarks", []) or []:
-                    if not isinstance(benchmark, dict):
-                        continue
-                    payload = self._v2_benchmark_payload(benchmark, work)
-                    if not payload.get("benchmark_name") or payload.get("benchmark_name") == "Unspecified benchmark":
-                        continue
-                    item = self._v2_upsert_canonical("benchmark_records", payload["benchmark_name"], payload, model_mode=model_mode)
-                    benchmark_ids.append(item["benchmark_id"])
-                    work_benchmark_ids.append(item["benchmark_id"])
-                    link = self._v2_evidence_link(field_id, "benchmark_records", item["benchmark_id"], work["work_id"], payload.get("evidence", ""))
-                    evidence_links.append(link)
-                    work_links.append(link)
-                for baseline in matrix.get("baseline_records", []):
-                    related_results = [result for result in matrix.get("result_records", []) if result.get("baseline_id") == baseline.get("baseline_id") or result.get("benchmark_id") == baseline.get("benchmark_id")]
-                    payload = self._v2_baseline_payload(baseline, work, related_results)
-                    if not self._is_supported_baseline_record(payload, work, related_results):
-                        continue
-                    item = self._v2_upsert_canonical("baseline_records", payload["baseline_name"], payload, model_mode=model_mode)
-                    baseline_ids.append(item["baseline_id"])
-                    work_baseline_ids.append(item["baseline_id"])
-                    link = self._v2_evidence_link(field_id, "baseline_records", item["baseline_id"], work["work_id"], payload.get("evidence", ""))
-                    evidence_links.append(link)
-                    work_links.append(link)
-                for baseline in extras.get("baselines", []) or []:
-                    if not isinstance(baseline, dict):
-                        continue
-                    payload = self._v2_baseline_payload(baseline, work, list(baseline.get("performance") or []))
-                    if not payload.get("baseline_name") or payload.get("baseline_name") == "Baseline":
-                        continue
-                    if not self._is_supported_baseline_record(payload, work, list(baseline.get("performance") or [])):
-                        continue
-                    item = self._v2_upsert_canonical("baseline_records", payload["baseline_name"], payload, model_mode=model_mode)
-                    baseline_ids.append(item["baseline_id"])
-                    work_baseline_ids.append(item["baseline_id"])
-                    link = self._v2_evidence_link(field_id, "baseline_records", item["baseline_id"], work["work_id"], payload.get("evidence", ""))
-                    evidence_links.append(link)
-                    work_links.append(link)
-                for result in matrix.get("result_records", []):
-                    result = dict(result)
-                    result.setdefault("source_work_id", work["work_id"])
-                    result_ids.append(result["result_id"])
-                    self.store.upsert("result_records", result, "result_id")
-                if work_links:
-                    self.store.upsert_many("evidence_links", work_links, "link_id")
-                self.add_project_memberships(field_id, "source_works", [work["work_id"]], source="v2_research", prepend=True)
-                self.add_project_memberships(field_id, "existed_ideas", self._ordered_unique(work_existed_ids), source="v2_research", prepend=True)
-                self.add_project_memberships(field_id, "principles", self._ordered_unique(work_principle_ids), source="v2_research")
-                self.add_project_memberships(field_id, "takeaway_messages", self._ordered_unique(work_message_ids), source="v2_research")
-                self.add_project_memberships(field_id, "benchmark_records", self._ordered_unique(work_benchmark_ids), source="v2_research")
-                self.add_project_memberships(field_id, "baseline_records", self._ordered_unique(work_baseline_ids), source="v2_research")
+
+            if total_batches:
                 update(
-                    "structured_extraction",
-                    f"Extracted structured evidence from {index}/{len(structured_raw_works)} selected works.",
-                    processed_works=index,
-                    structured_works_total=len(structured_raw_works),
+                    "research_batch_queue",
+                    f"Research will process {len(llm_candidates)} work(s) in {total_batches} full-text batch(es) of up to {full_text_batch_size}.",
+                    research_batch=0,
+                    research_batches_total=total_batches,
+                    unresearched_works=len(llm_candidate_pool),
                     found_works=len(works),
+                    already_researched_works=skipped_unchanged,
+                )
+
+            for batch_index, start in enumerate(range(0, len(llm_candidates), full_text_batch_size), start=1):
+                self._raise_if_cancelled(run_id)
+                raw_batch = llm_candidates[start : start + full_text_batch_size]
+                update(
+                    "full_text_batch",
+                    f"Fetching transient full text for research batch {batch_index}/{total_batches}.",
+                    research_batch=batch_index,
+                    research_batches_total=total_batches,
+                    batch_works=len(raw_batch),
+                    processed_works=processed_structured,
+                    structured_works_total=len(llm_candidate_pool),
+                    found_works=len(works),
+                    already_researched_works=skipped_unchanged,
+                )
+                batch_candidates = self._v2_attach_transient_full_text(raw_batch, run_id=run_id, progress_callback=update)
+                batch_llm_candidate_ids = {str(work.get("work_id") or "") for work in batch_candidates}
+                batch_work_lookup = {str(work.get("work_id") or ""): work for work in [*raw_batch, *batch_candidates]}
+                extraction_lookup = {str(work.get("work_id") or ""): work for work in batch_candidates}
+                persist_deterministic_full_text_records(batch_candidates, batch_llm_candidate_ids=batch_llm_candidate_ids, batch_index=batch_index)
+
+                def persist_current_batch(batch_extras: dict[str, dict[str, Any]]) -> None:
+                    persist_llm_concepts(batch_extras, batch_work_lookup)
+
+                batch_llm_extras = self._v2_llm_extract_batch(
+                    goal_text,
+                    batch_candidates,
+                    model_mode=model_mode,
+                    progress_callback=update,
+                    batch_result_callback=persist_current_batch,
+                    cancel_check=lambda: self._is_run_cancelled(run_id),
+                )
+                self._raise_if_cancelled(run_id)
+                llm_extras.update(batch_llm_extras)
+                llm_extract_error = str(getattr(self, "_last_v2_llm_extract_error", "") or "")
+                if llm_extract_error and llm_extract_error not in seen_llm_warnings:
+                    seen_llm_warnings.add(llm_extract_error)
+                    run["warnings"] = self._ordered_unique([*run.get("warnings", []), llm_extract_error])
+                    update("llm_extraction_warning", llm_extract_error)
+                update(
+                    "work_upsert",
+                    f"Finished LLM extraction for research batch {batch_index}/{total_batches}.",
+                    found_works=len(works),
+                    research_batch=batch_index,
+                    research_batches_total=total_batches,
+                    llm_extracted_works=len(llm_extras),
+                    skipped_unchanged_llm=skipped_unchanged,
+                    already_researched_works=skipped_unchanged,
+                )
+                persist_structured_records(
+                    batch_candidates,
+                    extraction_lookup,
+                    batch_llm_extras,
+                    batch_index=batch_index,
+                )
+                for batch_work in batch_candidates:
+                    batch_work.pop("transient_full_text", None)
+                batch_work_lookup.clear()
+                extraction_lookup.clear()
+                update(
+                    "full_text_batch_cleanup",
+                    f"Cleared transient full text for research batch {batch_index}/{total_batches}.",
+                    research_batch=batch_index,
+                    research_batches_total=total_batches,
+                    processed_works=processed_structured,
+                    structured_works_total=len(llm_candidate_pool),
+                    full_text_retained=0,
                     existed_ideas=len(set(existed_ids)),
                     principles=len(set(principle_ids)),
                     takeaway_messages=len(set(message_ids)),
                     benchmarks=len(set(benchmark_ids)),
                     baselines=len(set(baseline_ids)),
+                    already_researched_works=skipped_unchanged,
+                )
+
+            if not total_batches:
+                update(
+                    "structured_extraction",
+                    "No works need current-model research; all selected works already have current extraction.",
+                    processed_works=0,
+                    structured_works_total=0,
+                    found_works=len(works),
+                    skipped_unchanged_llm=skipped_unchanged,
+                    already_researched_works=skipped_unchanged,
                 )
             if evidence_links:
                 self.store.upsert_many("evidence_links", evidence_links, "link_id")
@@ -2591,6 +2898,15 @@ class PrincipiaEngine:
                 "benchmarks": len(set(benchmark_ids)),
                 "baselines": len(set(baseline_ids)),
                 "result_records": len(set(result_ids)),
+                "planned_works": len(llm_candidate_pool),
+                "unresearched_works": len(llm_candidate_pool),
+                "processed_works": processed_structured,
+                "structured_works_total": len(llm_candidate_pool),
+                "research_batches_total": total_batches,
+                "research_batch": total_batches,
+                "skipped_unchanged_llm": skipped_unchanged,
+                "already_researched_works": skipped_unchanged,
+                "full_text_retained": 0,
             }
             self.store.upsert("research_runs", run, "run_id")
             return {"ok": True, "run": run, "summary": self.v2_project_summary(field_id)}
@@ -2641,7 +2957,10 @@ class PrincipiaEngine:
             "takeaway_messages": "takeaway_messages",
             "my_ideas": "my_ideas",
         }.get(tab, tab)
+        if bucket not in {"my_ideas", "source_works"}:
+            self._v2_ensure_project_cloud_hydration(field_id, model_mode=model_mode)
         items = self._v2_project_records_fast(field_id, bucket, query=query)
+        items = self._v2_dedupe_presented_project_records(bucket, items)
         profile = self.store.get_item("field_profiles", field_id) or {}
         sort_query = query or profile.get("goal_text") or profile.get("query") or profile.get("name", "")
         sort_mode = str(sort_mode or "composite").lower()
@@ -2673,20 +2992,44 @@ class PrincipiaEngine:
         else:
             items.sort(key=lambda item: self._v2_sort_score(item, sort_query), reverse=True)
         total = len(items)
-        page = [self._v2_present_item(item, model_mode=model_mode, compact=True) for item in items[offset : offset + limit]]
+        raw_page = items[offset : offset + limit]
+        if bucket == "source_works":
+            page = [
+                self._v2_present_item(item, model_mode=model_mode, compact=True, include_work_counts=False)
+                for item in raw_page
+            ]
+            count_map = self._v2_work_extraction_count_map(
+                [str(item.get("work_id") or "") for item in raw_page],
+                model_mode=model_mode,
+            )
+            for item in page:
+                work_id = str(item.get("work_id") or "")
+                counts = count_map.get(work_id) or {}
+                item["work_extraction_counts"] = counts
+                item["work_extracted"] = int(counts.get("total") or 0) > 0
+        else:
+            page = [self._v2_present_item(item, model_mode=model_mode, compact=True) for item in raw_page]
         work_extraction_runs = self.v2_active_work_extraction_runs(field_id) if bucket == "source_works" else {}
         if work_extraction_runs:
             for item in page:
                 work_id = str(item.get("work_id") or "")
                 if work_id in work_extraction_runs:
                     item["work_extraction_run"] = work_extraction_runs[work_id]
+        counts = self.v2_project_counts_fast(field_id)
+        count_key = {
+            "source_works": "works",
+            "benchmark_records": "benchmarks",
+            "baseline_records": "baselines",
+        }.get(bucket, bucket)
+        if count_key in counts:
+            counts[count_key] = total
         return {
             "items": page,
             "total": total,
             "offset": offset,
             "limit": limit,
             "has_more": offset + limit < total,
-            "counts": self.v2_project_counts_fast(field_id),
+            "counts": counts,
             "work_extraction_runs": work_extraction_runs,
         }
 
@@ -2700,10 +3043,13 @@ class PrincipiaEngine:
         query: str = "",
         model_mode: str = "auto",
         sync_state: str = "unsynced",
+        include_counts: bool = True,
     ) -> dict[str, Any]:
         requested_tab = str(tab or "works")
         bucket = {
             "works": "source_works",
+            "queued_works": "source_works",
+            "research_tasks": "source_works",
             "ready_works": "source_works",
             "existed_ideas": "existed_ideas",
             "benchmarks": "benchmark_records",
@@ -2714,7 +3060,28 @@ class PrincipiaEngine:
         sync_state = str(sync_state or "unsynced").lower()
         items = self._v2_project_records_fast(field_id, bucket, query=query)
         work_sync = self._cloud_work_sync_map(field_id)
-        if sync_state in {"synced", "unsynced"}:
+        extraction_tabs = {"existed_ideas", "benchmarks", "baselines", "principles", "takeaway_messages"}
+        source_works = items if bucket == "source_works" else self._v2_project_records_fast(field_id, "source_works")
+        if requested_tab in {"queued_works", "research_tasks", "ready_works"}:
+            active_runs = self._cloud_active_run_map(field_id, model_mode)
+            work_statuses = {
+                work_id: self._cloud_work_status_from_counts(
+                    work_id,
+                    work,
+                    {},
+                    field_id=field_id,
+                    model_mode=model_mode,
+                    active_run=active_runs.get(work_id),
+                )
+                for work in source_works
+                for work_id in [str(work.get("work_id") or "")]
+                if work_id
+            }
+        elif requested_tab in extraction_tabs:
+            work_statuses = {}
+        else:
+            work_statuses = self._cloud_work_statuses(source_works, field_id=field_id, model_mode=model_mode)
+        if sync_state in {"synced", "unsynced"} and requested_tab not in {"queued_works", "research_tasks", "ready_works"} and requested_tab not in extraction_tabs:
             want_synced = sync_state == "synced"
             items = [
                 item
@@ -2722,10 +3089,19 @@ class PrincipiaEngine:
                 if self._cloud_record_is_synced(bucket, item, work_sync) == want_synced
             ]
         if requested_tab == "ready_works":
+            items = self._cloud_ready_work_rows(items, field_id=field_id, model_mode=model_mode)
+        elif requested_tab in {"queued_works", "research_tasks"}:
             items = [
                 item
                 for item in items
-                if self.cloud_work_research_status(str(item.get("work_id") or "")).get("ready_to_sync")
+                if self._cloud_work_matches_model_tab_status(item, requested_tab, work_statuses.get(str(item.get("work_id") or ""), {}))
+            ]
+        elif requested_tab in extraction_tabs:
+            eligible_work_ids = self._cloud_visible_extraction_work_ids(source_works, field_id=field_id, model_mode=model_mode)
+            items = [
+                item
+                for item in items
+                if self._cloud_concept_matches_lightweight_local_count(bucket, item, model_mode=model_mode, eligible_work_ids=eligible_work_ids)
             ]
         profile = self.store.get_item("field_profiles", field_id) or {}
         sort_query = query or profile.get("goal_text") or profile.get("query") or profile.get("name", "")
@@ -2741,12 +3117,39 @@ class PrincipiaEngine:
         else:
             items.sort(key=lambda item: self._v2_sort_score(item, sort_query), reverse=True)
         total = len(items)
-        page = [self._v2_present_item(item, model_mode=model_mode, compact=True) for item in items[offset : offset + limit]]
+        page = [
+            self._v2_present_item(
+                item,
+                model_mode=str(item.get("ready_model_mode") or model_mode),
+                compact=True,
+                include_work_counts=requested_tab not in {"queued_works", "research_tasks", "ready_works"},
+            )
+            for item in items[offset : offset + limit]
+        ]
         work_extraction_runs = self.v2_active_work_extraction_runs(field_id) if bucket == "source_works" else {}
         if bucket == "source_works":
             for item in page:
                 work_id = str(item.get("work_id") or "")
-                item["cloud_research_status"] = self.cloud_work_research_status(work_id, field_id=field_id)
+                item_model_mode = str(item.get("ready_model_mode") or model_mode)
+                model_meta = self._v2_model_meta(item_model_mode)
+                status = item.get("cloud_research_status") or work_statuses.get(work_id)
+                if not status and requested_tab not in {"queued_works", "research_tasks", "ready_works"}:
+                    status = self.cloud_work_research_status(work_id, field_id=field_id, model_mode=item_model_mode)
+                status = status or {}
+                if requested_tab == "research_tasks" and str(status.get("task_state") or ""):
+                    status = {**status, "state": str(status.get("task_state") or status.get("state") or "")}
+                if requested_tab == "queued_works":
+                    status = {**status, "state": "queued", "message": status.get("message") or "Queued for cloud research."}
+                item["cloud_research_status"] = status
+                item["cloud_target_model_mode"] = model_meta.get("model_mode", item_model_mode or "auto")
+                item["cloud_target_model_name"] = model_meta.get("model_name", item_model_mode or "auto")
+                item["cloud_target_provider"] = model_meta.get("provider", "")
+                item["model_mode"] = model_meta.get("model_mode", item_model_mode or "auto")
+                item["model_name"] = model_meta.get("model_name", item_model_mode or "auto")
+                item["provider"] = model_meta.get("provider", "")
+                model_counts = dict(status.get("counts") or {})
+                item["work_extraction_counts"] = model_counts
+                item["work_extracted"] = model_counts.get("total", 0) > 0
                 if work_id in work_extraction_runs:
                     item["work_extraction_run"] = work_extraction_runs[work_id]
         return {
@@ -2755,17 +3158,47 @@ class PrincipiaEngine:
             "offset": offset,
             "limit": limit,
             "has_more": offset + limit < total,
-            "counts": self.cloud_local_counts(field_id),
+            "counts": self.cloud_local_counts(field_id, model_mode=model_mode) if include_counts else {},
             "sync_state": sync_state,
             "work_extraction_runs": work_extraction_runs,
         }
 
-    def cloud_local_counts(self, field_id: str = "cloud-crawl") -> dict[str, Any]:
-        work_sync = self._cloud_work_sync_map(field_id)
+    def cloud_local_counts(self, field_id: str = "cloud-crawl", *, model_mode: str = "auto") -> dict[str, Any]:
         counts: dict[str, Any] = {}
-        ready_unsynced = 0
+        extraction_tabs = {"existed_ideas", "benchmarks", "baselines", "principles", "takeaway_messages"}
+        works = self._v2_project_records_fast(field_id, "source_works")
+        synced_works = sum(
+            1
+            for work in works
+            if any(
+                str((entry or {}).get("status") or "") == "synced"
+                for entry in ((work.get("cloud_sync_by_model") if isinstance(work.get("cloud_sync_by_model"), dict) else {}) or {}).values()
+                if isinstance(entry, dict)
+            )
+        )
+        queued_unsynced = sum(1 for work in works if self._cloud_work_matches_lightweight_queue_filter(work, model_mode))
+        task_unsynced = len(
+            [
+                work
+                for work in works
+                if self._cloud_work_matches_model_tab_status(
+                    work,
+                    "research_tasks",
+                    self._cloud_work_status_from_counts(
+                        str(work.get("work_id") or ""),
+                        work,
+                        {},
+                        field_id=field_id,
+                        model_mode=model_mode,
+                    ),
+                )
+            ]
+        )
+        ready_rows = self._cloud_ready_work_rows(works, field_id=field_id, model_mode=model_mode)
+        ready_work_ids = {str(work.get("work_id") or "") for work in ready_rows if work.get("work_id")}
+        ready_unsynced = len(ready_rows)
+        counts["works"] = {"total": len(works), "synced": synced_works, "unsynced": max(0, len(works) - synced_works)}
         for tab, bucket in {
-            "works": "source_works",
             "existed_ideas": "existed_ideas",
             "benchmarks": "benchmark_records",
             "baselines": "baseline_records",
@@ -2773,63 +3206,458 @@ class PrincipiaEngine:
             "takeaway_messages": "takeaway_messages",
         }.items():
             items = self._v2_project_records_fast(field_id, bucket)
-            synced = sum(1 for item in items if self._cloud_record_is_synced(bucket, item, work_sync))
-            counts[tab] = {"total": len(items), "synced": synced, "unsynced": max(0, len(items) - synced)}
-            if tab == "works":
-                ready_unsynced = sum(
-                    1
+            if tab in extraction_tabs:
+                visible = [
+                    item
                     for item in items
-                    if not self._cloud_record_is_synced(bucket, item, work_sync)
-                    and self.cloud_work_research_status(str(item.get("work_id") or ""), field_id=field_id).get("ready_to_sync")
-                )
+                    if self._cloud_concept_matches_lightweight_local_count(bucket, item, model_mode=model_mode, eligible_work_ids=ready_work_ids)
+                ]
+                counts[tab] = {"total": len(visible), "synced": 0, "unsynced": len(visible)}
+                continue
+        counts["queued_works"] = {"total": queued_unsynced, "synced": 0, "unsynced": queued_unsynced}
+        counts["research_tasks"] = {"total": task_unsynced, "synced": 0, "unsynced": task_unsynced}
         counts["ready_works"] = {"total": ready_unsynced, "synced": 0, "unsynced": ready_unsynced}
         return counts
 
-    def cloud_work_research_status(self, work_id: str, *, field_id: str = "cloud-crawl") -> dict[str, Any]:
+    def _cloud_lightweight_ready_work_ids(self, works: list[dict[str, Any]], *, field_id: str, model_mode: str) -> set[str]:
+        counts_by_work = self._cloud_lightweight_extraction_count_map(field_id, works, model_mode=model_mode)
+        ready_ids: set[str] = set()
+        for work in works:
+            work_id = str(work.get("work_id") or "")
+            if not work_id or self._cloud_work_synced_for_mode(work, model_mode):
+                continue
+            counts = counts_by_work.get(work_id, {})
+            if int(counts.get("existed_ideas") or 0) > 0 or int(counts.get("principles") or 0) > 0:
+                ready_ids.add(work_id)
+        return ready_ids
+
+    def _cloud_visible_extraction_work_ids(self, works: list[dict[str, Any]], *, field_id: str, model_mode: str) -> set[str]:
+        return {
+            str(work.get("work_id") or "")
+            for work in self._cloud_ready_work_rows(works, field_id=field_id, model_mode=model_mode)
+            if work.get("work_id")
+        }
+
+    def _cloud_lightweight_extraction_count_map(
+        self,
+        field_id: str,
+        works: list[dict[str, Any]],
+        *,
+        model_mode: str,
+        buckets: tuple[str, ...] = ("existed_ideas", "principles", "takeaway_messages", "benchmark_records", "baseline_records"),
+    ) -> dict[str, dict[str, int]]:
+        work_ids = self._ordered_unique([str(work.get("work_id") or "") for work in works if work.get("work_id")])
+        counts: dict[str, dict[str, int]] = {work_id: {bucket: 0 for bucket in buckets} for work_id in work_ids}
+        if not work_ids:
+            return counts
+        work_id_set = set(work_ids)
+        target_model = self._v2_model_meta(model_mode) if str(model_mode or "") not in {"", "all", "auto"} else {}
+        seen: set[tuple[str, str, str]] = set()
+        for bucket in buckets:
+            id_key = self._record_id_key(bucket)
+            for item in self._v2_project_records_fast(field_id, bucket):
+                if target_model and not self._v2_record_has_model_variant(item, target_model):
+                    continue
+                record_id = str(item.get(id_key) or item.get("canonical_id") or item.get("concept_id") or "")
+                if not record_id:
+                    continue
+                for work_id in self._cloud_record_work_ids(bucket, item):
+                    if work_id not in work_id_set:
+                        continue
+                    key = (work_id, bucket, record_id)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    counts.setdefault(work_id, {name: 0 for name in buckets})[bucket] += 1
+        for value in counts.values():
+            value["total"] = sum(int(value.get(bucket) or 0) for bucket in buckets)
+        return counts
+
+    def _cloud_work_synced_for_mode(self, work: dict[str, Any], model_mode: str) -> bool:
+        mode = str(model_mode or "")
+        if mode == "all":
+            return False
+        model_key = self._cloud_model_key(model_mode)
+        if mode in {"", "auto"}:
+            research_by_model = work.get("cloud_research_by_model") if isinstance(work.get("cloud_research_by_model"), dict) else {}
+            if model_key not in research_by_model:
+                sync_by_model = work.get("cloud_sync_by_model") if isinstance(work.get("cloud_sync_by_model"), dict) else {}
+                return any(str((entry or {}).get("status") or "") == "synced" for entry in sync_by_model.values() if isinstance(entry, dict))
+        return self._cloud_work_synced_for_model_key(work, model_key)
+
+    def _cloud_work_synced_for_model_key(self, work: dict[str, Any], model_key: str) -> bool:
+        sync_by_model = work.get("cloud_sync_by_model") if isinstance(work.get("cloud_sync_by_model"), dict) else {}
+        sync_entry = sync_by_model.get(str(model_key or "")) if isinstance(sync_by_model, dict) else {}
+        if str((sync_entry or {}).get("status") or "") != "synced":
+            return False
+        research_by_model = work.get("cloud_research_by_model") if isinstance(work.get("cloud_research_by_model"), dict) else {}
+        research_entry = research_by_model.get(str(model_key or "")) if isinstance(research_by_model, dict) else {}
+        if str((research_entry or {}).get("state") or "") == "synced":
+            return True
+        research_time = (
+            (research_entry or {}).get("updated_at")
+            or (research_entry or {}).get("completed_at")
+            or work.get("cloud_research_updated_at")
+        )
+        if not research_time:
+            return True
+        synced_at = (sync_entry or {}).get("synced_at")
+        synced_dt = self._parse_iso_datetime(synced_at)
+        research_dt = self._parse_iso_datetime(research_time)
+        if not synced_dt or not research_dt:
+            return str(synced_at or "") >= str(research_time or "")
+        return synced_dt >= research_dt
+
+    def _cloud_work_has_lightweight_ready_state(self, work: dict[str, Any], *, model_mode: str = "auto") -> bool:
+        by_model = work.get("cloud_research_by_model") if isinstance(work.get("cloud_research_by_model"), dict) else {}
+        target_meta = self._v2_model_meta(model_mode) if str(model_mode or "") not in {"", "all", "auto"} else {}
+        target_mode = str(target_meta.get("model_mode") or model_mode or "")
+        sync_by_model = work.get("cloud_sync_by_model") if isinstance(work.get("cloud_sync_by_model"), dict) else {}
+        for key, entry in by_model.items():
+            if not isinstance(entry, dict):
+                continue
+            state = str(entry.get("state") or "")
+            if state not in {"ready", "needs_review", "done", "metadata_only", "failed", "stopped"}:
+                continue
+            entry_mode = str(entry.get("model_mode") or "")
+            if target_mode not in {"", "all", "auto"} and entry_mode != target_mode:
+                continue
+            sync_entry = sync_by_model.get(str(entry.get("model_key") or key)) if isinstance(sync_by_model, dict) else {}
+            if str((sync_entry or {}).get("status") or "") == "synced":
+                continue
+            return True
+        return False
+
+    def _cloud_concept_matches_lightweight_local_count(
+        self,
+        bucket: str,
+        item: dict[str, Any],
+        *,
+        model_mode: str,
+        eligible_work_ids: set[str],
+    ) -> bool:
+        if not eligible_work_ids:
+            return False
+        target_model = self._v2_model_meta(model_mode) if str(model_mode or "") not in {"", "all", "auto"} else {}
+        if target_model and not self._v2_record_has_model_variant(item, target_model):
+            return False
+        return any(work_id in eligible_work_ids for work_id in self._cloud_record_work_ids(bucket, item))
+
+    def _cloud_work_matches_model_tab(self, item: dict[str, Any], tab: str, *, field_id: str, model_mode: str) -> bool:
+        status = self.cloud_work_research_status(str(item.get("work_id") or ""), field_id=field_id, model_mode=model_mode)
+        return self._cloud_work_matches_model_tab_status(item, tab, status)
+
+    def _cloud_work_matches_model_tab_status(self, item: dict[str, Any], tab: str, status: dict[str, Any]) -> bool:
+        if status.get("synced") and tab not in {"queued_works", "research_tasks"}:
+            return False
+        if tab == "ready_works":
+            return str(status.get("model_mode") or "") != "all" and bool(status.get("ready_to_sync"))
+        if tab == "research_tasks":
+            task_state = str(status.get("task_state") or "")
+            if task_state:
+                return task_state in {"research_task", "researching", "done", "failed", "stopped", "metadata_only"}
+            return str(status.get("state") or "") in {"research_task", "researching", "done", "failed", "stopped", "metadata_only"}
+        if tab == "queued_works":
+            state = str(status.get("state") or "")
+            generic_state = self._cloud_generic_queue_state(item)
+            if str(status.get("model_mode") or "") == "all":
+                if generic_state == "removed":
+                    return False
+                if generic_state in {"queued", "research_task", "ready", "needs_review", "metadata_only", "failed", "stopped", "synced"}:
+                    return True
+                return not status.get("has_model_state") and str(item.get("cloud_local_origin") or "") == "cloud_crawl"
+            if status.get("cloud_has_target_model"):
+                return False
+            if generic_state == "removed":
+                return False
+            if generic_state in {"queued", "research_task", "ready", "needs_review", "metadata_only", "failed", "stopped", "synced"}:
+                return True
+            if str(item.get("cloud_local_origin") or "") == "cloud_crawl":
+                return True
+            return bool(status.get("has_model_state")) and state in {"queued", "needs_review", "metadata_only", "failed", "stopped"}
+        return True
+
+    def _cloud_ready_work_rows(self, works: list[dict[str, Any]], *, field_id: str, model_mode: str) -> list[dict[str, Any]]:
+        requested_mode = str(model_mode or "auto")
+        rows: list[dict[str, Any]] = []
+        candidate_modes: list[str] = []
+        modes_by_work: dict[str, list[str]] = {}
+        extraction_modes_by_work = self._cloud_lightweight_extraction_modes_by_work(field_id, works)
+        for work in works:
+            work_id = str(work.get("work_id") or "")
+            if not work_id:
+                continue
+            modes = self._cloud_ready_model_modes(work, requested_mode)
+            for mode in extraction_modes_by_work.get(work_id, []):
+                if requested_mode not in {"", "all", "auto"} and mode != requested_mode:
+                    continue
+                if mode not in modes:
+                    modes.append(mode)
+            if requested_mode not in {"", "all"} and requested_mode not in modes and (requested_mode != "auto" or not modes):
+                modes.append(requested_mode)
+            modes_by_work[work_id] = modes
+            for mode in modes:
+                if mode not in candidate_modes:
+                    candidate_modes.append(mode)
+        counts_by_mode = {
+            mode: self._cloud_lightweight_extraction_count_map(field_id, works, model_mode=mode)
+            for mode in candidate_modes
+        }
+        active_runs_by_mode = {mode: self._cloud_active_run_map(field_id, mode) for mode in candidate_modes}
+        for work in works:
+            work_id = str(work.get("work_id") or "")
+            if not work_id:
+                continue
+            for ready_mode in modes_by_work.get(work_id, []):
+                if self._cloud_work_synced_for_mode(work, ready_mode):
+                    continue
+                counts = counts_by_mode.get(ready_mode, {}).get(work_id, {})
+                if int(counts.get("existed_ideas") or 0) <= 0 and int(counts.get("principles") or 0) <= 0:
+                    continue
+                status = self._cloud_work_status_from_counts(
+                    work_id,
+                    work,
+                    counts,
+                    field_id=field_id,
+                    model_mode=ready_mode,
+                    active_run=active_runs_by_mode.get(ready_mode, {}).get(work_id),
+                )
+                if not self._cloud_work_matches_model_tab_status(work, "ready_works", status):
+                    continue
+                row = dict(work)
+                row["ready_model_mode"] = ready_mode
+                row["ready_model_key"] = status.get("model_key", "")
+                row["ready_record_id"] = f"{work_id}::{ready_mode}"
+                row["cloud_research_status"] = status
+                rows.append(row)
+        return rows
+
+    def _cloud_lightweight_extraction_modes_by_work(self, field_id: str, works: list[dict[str, Any]]) -> dict[str, list[str]]:
+        work_ids = {str(work.get("work_id") or "") for work in works if work.get("work_id")}
+        modes_by_work: dict[str, list[str]] = {work_id: [] for work_id in work_ids}
+        if not work_ids:
+            return modes_by_work
+        for bucket in ("existed_ideas", "principles", "takeaway_messages", "benchmark_records", "baseline_records"):
+            for item in self._v2_project_records_fast(field_id, bucket):
+                modes = self._cloud_record_model_modes(item)
+                if not modes:
+                    continue
+                for work_id in self._cloud_record_work_ids(bucket, item):
+                    if work_id not in modes_by_work:
+                        continue
+                    for mode in modes:
+                        if mode not in modes_by_work[work_id]:
+                            modes_by_work[work_id].append(mode)
+        return modes_by_work
+
+    def _cloud_record_model_modes(self, item: dict[str, Any]) -> list[str]:
+        modes: list[str] = []
+        for variant in (item.get("variants") or {}).values():
+            if not isinstance(variant, dict):
+                continue
+            mode = str(variant.get("model_mode") or "")
+            if mode and mode not in {"all", "metadata", "manual"} and mode not in modes:
+                modes.append(mode)
+        mode = str(item.get("model_mode") or "")
+        if mode and mode not in {"all", "metadata", "manual"} and mode not in modes:
+            modes.append(mode)
+        return modes
+
+    def _cloud_ready_model_modes(self, work: dict[str, Any], requested_mode: str) -> list[str]:
+        modes: list[str] = []
+        by_model = work.get("cloud_research_by_model") if isinstance(work.get("cloud_research_by_model"), dict) else {}
+        for entry in by_model.values():
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("state") or "") in {"removed", "synced"}:
+                continue
+            mode = str(entry.get("model_mode") or "")
+            if not mode or mode in {"all", "metadata"}:
+                continue
+            if requested_mode not in {"", "all", "auto"} and mode != requested_mode:
+                continue
+            if mode not in modes:
+                modes.append(mode)
+        return modes
+
+    def _cloud_work_has_any_queue_state(self, item: dict[str, Any]) -> bool:
+        by_model = item.get("cloud_research_by_model") if isinstance(item.get("cloud_research_by_model"), dict) else {}
+        if by_model:
+            return any(str((entry or {}).get("state") or "") != "removed" for entry in by_model.values() if isinstance(entry, dict))
+        return str(item.get("cloud_local_origin") or "") == "cloud_crawl" or str(item.get("cloud_research_state") or "") in {
+            "queued",
+            "researching",
+            "research_task",
+            "ready",
+            "needs_review",
+            "metadata_only",
+            "failed",
+            "stopped",
+            "synced",
+        }
+
+    def _cloud_generic_queue_state(self, item: dict[str, Any]) -> str:
+        by_model = item.get("cloud_research_by_model") if isinstance(item.get("cloud_research_by_model"), dict) else {}
+        for entry in by_model.values():
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("model_mode") or "") == "all":
+                return str(entry.get("state") or "")
+        return str(item.get("cloud_research_state") or "")
+
+    def _cloud_work_task_state(self, item: dict[str, Any]) -> str:
+        return str((item or {}).get("cloud_task_state") or "")
+
+    def _cloud_concept_matches_model_tab(self, bucket: str, item: dict[str, Any], *, field_id: str, model_mode: str, work_statuses: dict[str, dict[str, Any]] | None = None) -> bool:
+        target_model = self._v2_model_meta(model_mode) if str(model_mode or "") not in {"", "all", "auto"} else {}
+        if target_model and not self._v2_record_has_model_variant(item, target_model):
+            return False
+        work_ids = self._cloud_record_work_ids(bucket, item)
+        if not work_ids:
+            return False
+        work_statuses = work_statuses or {}
+        for work_id in work_ids:
+            status = work_statuses.get(work_id) or self.cloud_work_research_status(work_id, field_id=field_id, model_mode=model_mode)
+            if status.get("synced"):
+                continue
+            counts = status.get("counts") or {}
+            if int(counts.get(bucket) or 0) <= 0:
+                continue
+            state = str(status.get("state") or "")
+            if state in {"removed", "not_queued"} and int(counts.get("total") or 0) <= 0:
+                continue
+            if status.get("ready_to_sync") or (
+                state in {"needs_review", "metadata_only", "failed", "stopped"}
+                and int(counts.get(bucket) or 0) > 0
+            ):
+                return True
+        return False
+
+    def cloud_work_research_status(self, work_id: str, *, field_id: str = "cloud-crawl", model_mode: str = "auto") -> dict[str, Any]:
         work_id = str(work_id or "")
         work = self.store.get_item("source_works", work_id) if work_id else {}
-        counts = self.v2_work_extraction_counts(work_id)
-        required = {
-            "existed_ideas": int(counts.get("existed_ideas") or 0),
-            "principles": int(counts.get("principles") or 0),
-            "takeaway_messages": int(counts.get("takeaway_messages") or 0),
+        counts = self.v2_work_extraction_counts(work_id, model_mode="" if str(model_mode or "") == "all" else model_mode)
+        active = self._cloud_active_run_map(field_id, model_mode).get(work_id)
+        return self._cloud_work_status_from_counts(work_id, work or {}, counts, field_id=field_id, model_mode=model_mode, active_run=active)
+
+    def _cloud_work_statuses(self, works: list[dict[str, Any]], *, field_id: str, model_mode: str) -> dict[str, dict[str, Any]]:
+        work_ids = [str(work.get("work_id") or "") for work in works if work.get("work_id")]
+        counts_by_work = self._v2_work_extraction_count_map(work_ids, model_mode="" if str(model_mode or "") == "all" else model_mode)
+        active_runs = self._cloud_active_run_map(field_id, model_mode)
+        return {
+            work_id: self._cloud_work_status_from_counts(
+                work_id,
+                work,
+                counts_by_work.get(work_id, {}),
+                field_id=field_id,
+                model_mode=model_mode,
+                active_run=active_runs.get(work_id),
+            )
+            for work in works
+            for work_id in [str(work.get("work_id") or "")]
+            if work_id
         }
-        missing = [bucket for bucket, count in required.items() if count <= 0]
-        synced = str((work or {}).get("cloud_sync_status") or "") == "synced"
-        stored_state = str((work or {}).get("cloud_research_state") or "").strip()
+
+    def _cloud_work_status_from_counts(
+        self,
+        work_id: str,
+        work: dict[str, Any],
+        counts: dict[str, int],
+        *,
+        field_id: str,
+        model_mode: str,
+        active_run: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        model_meta = self._v2_model_meta(model_mode)
+        model_key = self._cloud_model_key(model_mode)
+        normalized_counts = {bucket: int((counts or {}).get(bucket) or 0) for bucket in ("existed_ideas", "principles", "takeaway_messages", "benchmark_records", "baseline_records")}
+        normalized_counts["total"] = sum(normalized_counts.values())
+        has_core_extraction = int(normalized_counts.get("existed_ideas") or 0) > 0 or int(normalized_counts.get("principles") or 0) > 0
+        required = {
+            "principle_or_existed_idea": 1 if has_core_extraction else 0,
+            "existed_ideas": int(normalized_counts.get("existed_ideas") or 0),
+            "principles": int(normalized_counts.get("principles") or 0),
+        }
+        missing = [] if has_core_extraction else ["principle_or_existed_idea"]
+        sync_by_model = (work or {}).get("cloud_sync_by_model") if isinstance((work or {}).get("cloud_sync_by_model"), dict) else {}
+        sync_entry = sync_by_model.get(model_key) if isinstance(sync_by_model, dict) else {}
+        synced = self._cloud_work_synced_for_model_key(work or {}, model_key)
+        research_by_model = (work or {}).get("cloud_research_by_model") if isinstance((work or {}).get("cloud_research_by_model"), dict) else {}
+        model_entry = research_by_model.get(model_key) if isinstance(research_by_model, dict) else {}
+        stored_state = str((model_entry or {}).get("state") or "").strip()
         state = stored_state
+        task_state = self._cloud_work_task_state(work or {})
         active_run_id = ""
         active_message = ""
-        for run in self.store.list_items("research_runs", limit=100000):
-            if (
-                run.get("type") == "v1_cloud_crawl_research"
-                and run.get("field_id") == field_id
-                and run.get("status") in {"queued", "running"}
-                and str((run.get("counts") or {}).get("current_work_id") or run.get("current_work_id") or "") == work_id
-            ):
-                active_run_id = str(run.get("run_id") or "")
-                active_message = str(run.get("message") or "")
+        if active_run:
+            active_run_id = str(active_run.get("run_id") or "")
+            active_message = str(active_run.get("message") or "")
+            state = "researching"
+        available_model_modes = self._cloud_available_model_modes(work)
+        ready = has_core_extraction and str(model_mode or "") != "all"
+        if str(model_mode or "") == "all":
+            generic_state = self._cloud_generic_queue_state(work or {})
+            if task_state == "researching":
                 state = "researching"
-                break
-        ready = not missing
-        if synced:
+            elif generic_state:
+                state = generic_state
+            elif str((work or {}).get("cloud_local_origin") or "") == "cloud_crawl":
+                state = "queued"
+            else:
+                state = "not_queued"
+        elif synced:
             state = "synced"
         elif ready and state not in {"researching", "failed"}:
             state = "ready"
         elif not state:
-            state = "metadata_only" if counts.get("total", 0) <= 0 else "needs_review"
+            state = "needs_review" if normalized_counts.get("total", 0) > 0 else "not_queued"
         return {
             "work_id": work_id,
+            "model_key": model_key,
+            "model_mode": model_mode or "auto",
+            "model_name": model_meta.get("model_name", model_mode or "auto"),
+            "provider": model_meta.get("provider", ""),
             "state": state,
             "ready_to_sync": bool(ready and not synced),
             "synced": synced,
+            "has_model_state": bool(model_entry),
+            "task_state": task_state,
+            "task_message": str((work or {}).get("cloud_task_message") or ""),
+            "task_updated_at": str((work or {}).get("cloud_task_updated_at") or ""),
+            "cloud_available_model_modes": available_model_modes,
+            "cloud_has_target_model": bool(model_mode and model_mode != "all" and model_mode in available_model_modes),
             "missing_required": missing,
             "required_counts": required,
-            "counts": counts,
-            "run_id": active_run_id or str((work or {}).get("cloud_research_run_id") or ""),
-            "message": active_message or str((work or {}).get("cloud_research_message") or ""),
-            "updated_at": str((work or {}).get("cloud_research_updated_at") or (work or {}).get("updated_at") or ""),
+            "counts": normalized_counts,
+            "run_id": active_run_id or str((model_entry or {}).get("run_id") or ""),
+            "message": active_message or str((model_entry or {}).get("message") or ""),
+            "updated_at": str((model_entry or {}).get("updated_at") or (work or {}).get("updated_at") or ""),
         }
+
+    def _cloud_available_model_modes(self, work: dict[str, Any]) -> list[str]:
+        modes: list[str] = []
+        for key in work.get("cloud_available_model_keys") or []:
+            parts = str(key or "").split(":")
+            if len(parts) >= 3 and parts[2] and parts[2] not in modes:
+                modes.append(parts[2])
+        for mode in work.get("cloud_available_model_modes") or []:
+            if str(mode or "") and str(mode) not in modes:
+                modes.append(str(mode))
+        return modes
+
+    def _cloud_active_run_map(self, field_id: str, model_mode: str) -> dict[str, dict[str, Any]]:
+        output: dict[str, dict[str, Any]] = {}
+        for run in self.store.list_research_runs_for_field(field_id, limit=100000):
+            if (
+                run.get("type") != "v1_cloud_crawl_research"
+                or run.get("status") not in {"queued", "running"}
+                or str(run.get("model_mode") or "auto") != str(model_mode or "auto")
+            ):
+                continue
+            work_id = str((run.get("counts") or {}).get("current_work_id") or run.get("current_work_id") or "")
+            if work_id:
+                output[work_id] = run
+        return output
 
     def _set_cloud_work_research_state(
         self,
@@ -2838,6 +3666,58 @@ class PrincipiaEngine:
         *,
         run_id: str = "",
         message: str = "",
+        model_mode: str = "auto",
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        work_id = str(work_id or "")
+        if not work_id:
+            return
+        work = self.store.get_item("source_works", work_id)
+        if not work:
+            return
+        now = utc_now()
+        model_key = self._cloud_model_key(model_mode)
+        by_model = work.get("cloud_research_by_model") if isinstance(work.get("cloud_research_by_model"), dict) else {}
+        model_entry = {
+            **dict(by_model.get(model_key) or {}),
+            "state": state,
+            "run_id": run_id,
+            "message": message,
+            "model_mode": model_mode or "auto",
+            "model_key": model_key,
+            "updated_at": now,
+        }
+        if state == "researching":
+            model_entry.setdefault("started_at", now)
+        if state in {"ready", "failed", "metadata_only", "stopped", "synced", "removed"}:
+            model_entry["completed_at"] = now
+        if extra:
+            model_entry.update(extra)
+        by_model[model_key] = model_entry
+        update = {
+            "cloud_research_state": state,
+            "cloud_research_run_id": run_id,
+            "cloud_research_message": message,
+            "cloud_research_updated_at": now,
+            "cloud_research_model_key": model_key,
+            "cloud_research_by_model": by_model,
+            "updated_at": now,
+        }
+        if state == "researching":
+            update.setdefault("cloud_research_started_at", now)
+        if state in {"ready", "failed", "metadata_only", "stopped", "synced"}:
+            update["cloud_research_completed_at"] = now
+        work.update(update)
+        self.store.upsert("source_works", work, "work_id")
+
+    def _set_cloud_work_task_state(
+        self,
+        work_id: str,
+        state: str,
+        *,
+        run_id: str = "",
+        message: str = "",
+        model_mode: str = "",
         extra: dict[str, Any] | None = None,
     ) -> None:
         work_id = str(work_id or "")
@@ -2848,20 +3728,340 @@ class PrincipiaEngine:
             return
         now = utc_now()
         update = {
-            "cloud_research_state": state,
-            "cloud_research_run_id": run_id,
-            "cloud_research_message": message,
-            "cloud_research_updated_at": now,
+            "cloud_task_state": state,
+            "cloud_task_run_id": run_id,
+            "cloud_task_message": message,
+            "cloud_task_model_mode": model_mode or work.get("cloud_task_model_mode", ""),
+            "cloud_task_updated_at": now,
             "updated_at": now,
         }
         if state == "researching":
-            update.setdefault("cloud_research_started_at", now)
-        if state in {"ready", "failed", "metadata_only", "stopped", "synced"}:
-            update["cloud_research_completed_at"] = now
+            update["cloud_task_started_at"] = now
+        if state in {"done", "failed", "metadata_only", "stopped", "removed"}:
+            update["cloud_task_completed_at"] = now
         if extra:
             update.update(extra)
         work.update(update)
         self.store.upsert("source_works", work, "work_id")
+
+    def queue_cloud_candidates(
+        self,
+        candidates: list[dict[str, Any]],
+        *,
+        field_id: str = "cloud-crawl",
+        model_mode: str = "auto",
+        recover_abstracts: bool = False,
+        include_tab: bool = True,
+        include_counts: bool = True,
+    ) -> dict[str, Any]:
+        if not candidates:
+            tab = self.build_cloud_local_tab(field_id, "queued_works", model_mode=model_mode, sync_state="unsynced", include_counts=include_counts) if include_tab else {}
+            return {"ok": True, "work_ids": [], "works": [], "tab": tab}
+        self._ensure_field_profile(field_id, "Cloud Library queue")
+        work_ids: list[str] = []
+        candidate_rows = [dict(item) for item in candidates]
+        if recover_abstracts:
+            candidate_rows = self._recover_candidate_abstracts(candidate_rows)
+        for candidate in candidate_rows:
+            candidate = dict(candidate)
+            candidate.setdefault("cloud_local_origin", "cloud_crawl")
+            candidate.setdefault("cloud_sync_status", "unsynced")
+            work = self._v2_upsert_work(candidate, model_mode="metadata")
+            work_ids.append(work["work_id"])
+            self._set_cloud_work_research_state(
+                work["work_id"],
+                "queued",
+                model_mode="all",
+                message="Queued for cloud research.",
+            )
+        unique_work_ids = self._ordered_unique(work_ids)
+        self._annotate_cloud_availability(unique_work_ids)
+        self.add_project_memberships(field_id, "source_works", unique_work_ids, source="cloud_queue", prepend=True)
+        work_rows = []
+        for work_id in unique_work_ids:
+            work = self.store.get_item("source_works", work_id) or {}
+            if not work:
+                continue
+            item = self._v2_present_item(work, model_mode="all", compact=True, include_work_counts=False)
+            item["cloud_research_status"] = self.cloud_work_research_status(work_id, field_id=field_id, model_mode="all")
+            work_rows.append(item)
+        return {
+            "ok": True,
+            "work_ids": unique_work_ids,
+            "works": work_rows,
+            "tab": self.build_cloud_local_tab(field_id, "queued_works", model_mode="all", sync_state="unsynced", limit=1000, include_counts=include_counts) if include_tab else {},
+        }
+
+    def _annotate_cloud_availability(self, work_ids: list[str]) -> None:
+        works = [self.store.get_item("source_works", work_id) for work_id in work_ids]
+        candidates = [work for work in works if work]
+        if not candidates:
+            return
+        try:
+            decisions = CloudResolver(self.store).resolve_batch(candidates, "", hydrate=False, project_id="cloud-crawl")
+        except Exception:
+            return
+        by_local_id = {str(item.get("candidate_work_id") or ""): item for item in decisions}
+        for work in candidates:
+            work_id = str(work.get("work_id") or "")
+            decision = by_local_id.get(work_id) or {}
+            route = decision.get("route") or {}
+            latest = route.get("latest_by_model") or {}
+            model_keys = sorted(str(key) for key in latest.keys() if key)
+            if model_keys:
+                work["cloud_available_model_keys"] = model_keys
+                work["cloud_available_model_modes"] = self._cloud_available_model_modes({"cloud_available_model_keys": model_keys})
+            work["cloud_lookup_decision"] = decision.get("decision") or "not_in_cloud"
+            work["cloud_lookup_checked_at"] = utc_now()
+            self.store.upsert("source_works", work, "work_id")
+
+    def _v2_ensure_project_cloud_hydration(self, field_id: str, *, model_mode: str = "auto", work_ids: list[str] | None = None) -> int:
+        field_id = str(field_id or "default")
+        if work_ids is None:
+            works = self._v2_project_records_fast(field_id, "source_works")
+        else:
+            works = [self.store.get_item("source_works", str(work_id)) for work_id in work_ids if str(work_id or "")]
+            works = [work for work in works if work]
+        candidates: list[dict[str, Any]] = []
+        for work in works:
+            origin = work.get("cloud_origin") if isinstance(work.get("cloud_origin"), dict) else {}
+            record_id = str(origin.get("cloud_record_id") or "")
+            if not record_id:
+                continue
+            snapshot_id = str(origin.get("cloud_snapshot_id") or "")
+            model_key = str(origin.get("cloud_model_key") or self._cloud_model_key(model_mode))
+            marker = "|".join(["v2", field_id, record_id, snapshot_id, model_key])
+            markers = set(str(item) for item in (work.get("cloud_hydrated_project_keys") or []) if item)
+            if marker in markers:
+                continue
+            candidates.append({"work": work, "record_id": record_id, "snapshot_id": snapshot_id, "model_key": model_key, "marker": marker})
+        if not candidates:
+            return 0
+        hydrated = 0
+        try:
+            resolver = CloudResolver(self.store)
+            manifest = resolver.manifest_client.load_manifest()
+        except Exception:
+            return 0
+        manifest_snapshot = str(manifest.get("snapshot_id") or "")
+        for candidate in candidates[:100]:
+            work = candidate["work"]
+            work_id = str(work.get("work_id") or "")
+            try:
+                bundle = resolver.fetch_work_bundle_by_id(str(candidate["record_id"]), manifest)
+            except Exception:
+                bundle = None
+            if not bundle:
+                continue
+            snapshot_id = str(candidate["snapshot_id"] or manifest_snapshot)
+            model_key = str(candidate["model_key"] or self._cloud_model_key(model_mode))
+            try:
+                resolver.hydrator.hydrate_work_bundle(bundle, snapshot_id=snapshot_id, model_key=model_key, project_id=field_id)
+                if work_id:
+                    self._v2_add_existing_extractions_to_project(field_id, work_id, model_mode=model_mode or "auto", source="cloud_lazy_hydrate")
+                refreshed = self.store.get_item("source_works", work_id) or work
+                markers = self._ordered_unique([*(refreshed.get("cloud_hydrated_project_keys") or []), str(candidate["marker"])])
+                refreshed["cloud_hydrated_project_keys"] = markers[-50:]
+                refreshed["cloud_hydrated_at"] = utc_now()
+                self.store.upsert("source_works", refreshed, "work_id")
+                hydrated += 1
+            except Exception:
+                continue
+        return hydrated
+
+    def _recover_candidate_abstracts(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        missing = [idx for idx, item in enumerate(candidates) if not compact_text(item.get("abstract") or "", 20) and (item.get("url_or_doi") or item.get("source_urls"))]
+        if not missing:
+            return candidates
+        output = list(candidates)
+
+        def recover(index: int) -> tuple[int, dict[str, Any]]:
+            return index, recover_missing_abstract(candidates[index], timeout=5)
+
+        with ThreadPoolExecutor(max_workers=min(6, len(missing))) as executor:
+            futures = [executor.submit(recover, idx) for idx in missing]
+            for future in as_completed(futures):
+                try:
+                    index, item = future.result()
+                except Exception:
+                    continue
+                output[index] = item
+        return output
+
+    def remove_cloud_queue(
+        self,
+        work_ids: list[str],
+        *,
+        field_id: str = "cloud-crawl",
+        model_mode: str = "auto",
+    ) -> dict[str, Any]:
+        removed: list[str] = []
+        for work_id in self._ordered_unique([str(item) for item in work_ids if item]):
+            status = self.cloud_work_research_status(work_id, field_id=field_id, model_mode=model_mode)
+            if status.get("state") == "researching":
+                continue
+            self._set_cloud_work_research_state(
+                work_id,
+                "removed",
+                model_mode="all",
+                message="Removed from queued papers.",
+            )
+            removed.append(work_id)
+        return {
+            "ok": True,
+            "removed_work_ids": removed,
+            "tab": self.build_cloud_local_tab(field_id, "queued_works", model_mode=model_mode, sync_state="unsynced", limit=1000),
+        }
+
+    def add_cloud_research_tasks(
+        self,
+        work_ids: list[str],
+        *,
+        field_id: str = "cloud-crawl",
+        model_mode: str = "auto",
+        include_tab: bool = True,
+        include_counts: bool = True,
+    ) -> dict[str, Any]:
+        added: list[str] = []
+        for work_id in self._ordered_unique([str(item) for item in work_ids if item]):
+            work = self.store.get_item("source_works", work_id) or {}
+            if self._cloud_work_task_state(work) == "researching":
+                continue
+            self._set_cloud_work_task_state(
+                work_id,
+                "research_task",
+                model_mode=model_mode,
+                message="Moved from queued papers to research tasks.",
+            )
+            added.append(work_id)
+        return {
+            "ok": True,
+            "added_work_ids": added,
+            "tab": self.build_cloud_local_tab(field_id, "research_tasks", model_mode="all", sync_state="unsynced", limit=1000, include_counts=include_counts) if include_tab else {},
+        }
+
+    def add_all_cloud_research_tasks(
+        self,
+        *,
+        field_id: str = "cloud-crawl",
+        model_mode: str = "all",
+        limit: int = 10000,
+        include_tab: bool = False,
+        include_counts: bool = False,
+    ) -> dict[str, Any]:
+        model_mode = str(model_mode or "all")
+        limit = max(1, min(int(limit or 10000), 50000))
+        works = self._v2_project_records_fast(field_id, "source_works")
+        matched: list[dict[str, Any]] = []
+        existing_task_ids: list[str] = []
+        for work in works:
+            work_id = str(work.get("work_id") or "")
+            if not work_id:
+                continue
+            if not self._cloud_work_matches_lightweight_queue_filter(work, model_mode):
+                continue
+            if str(work.get("cloud_task_state") or "") in {"research_task", "researching"}:
+                existing_task_ids.append(work_id)
+                continue
+            matched.append(work)
+            if len(matched) >= limit:
+                break
+        now = utc_now()
+        added: list[str] = []
+        updated: list[dict[str, Any]] = []
+        for work in matched:
+            work_id = str(work.get("work_id") or "")
+            item = dict(work)
+            item.update(
+                {
+                    "cloud_task_state": "research_task",
+                    "cloud_task_run_id": "",
+                    "cloud_task_message": "Added to Research Tasks.",
+                    "cloud_task_model_mode": model_mode or "all",
+                    "cloud_task_updated_at": now,
+                    "updated_at": now,
+                }
+            )
+            updated.append(item)
+            added.append(work_id)
+        if updated:
+            self.store.upsert_many("source_works", updated, "work_id")
+        return {
+            "ok": True,
+            "added_work_ids": added,
+            "matched_work_ids": added,
+            "existing_task_work_ids": existing_task_ids,
+            "tab": self.build_cloud_local_tab(field_id, "research_tasks", model_mode="all", sync_state="unsynced", limit=1000, include_counts=include_counts) if include_tab else {},
+            "counts": self.cloud_local_counts(field_id, model_mode=model_mode) if include_counts else {},
+        }
+
+    def _cloud_work_matches_lightweight_queue_filter(self, work: dict[str, Any], model_mode: str) -> bool:
+        generic_state = self._cloud_generic_queue_state(work)
+        if generic_state == "removed":
+            return False
+        is_local_cloud_queue = str(work.get("cloud_local_origin") or "") == "cloud_crawl"
+        if generic_state and generic_state not in {"queued", "research_task", "ready", "needs_review", "metadata_only", "failed", "stopped", "synced"}:
+            return False
+        if not generic_state and not is_local_cloud_queue:
+            return False
+        if model_mode in {"", "all", "auto"}:
+            return True
+        available_modes = self._cloud_available_model_modes(work)
+        # This mutation must remain instant. If coverage is unknown, defer the
+        # expensive cloud freshness check to Start Research, where progress UI exists.
+        return model_mode not in available_modes
+
+    def remove_cloud_research_tasks(
+        self,
+        work_ids: list[str],
+        *,
+        field_id: str = "cloud-crawl",
+        model_mode: str = "auto",
+    ) -> dict[str, Any]:
+        removed: list[str] = []
+        for work_id in self._ordered_unique([str(item) for item in work_ids if item]):
+            work = self.store.get_item("source_works", work_id) or {}
+            if self._cloud_work_task_state(work) == "researching":
+                continue
+            self._set_cloud_work_task_state(
+                work_id,
+                "removed",
+                model_mode=model_mode,
+                message="Removed from research tasks.",
+            )
+            removed.append(work_id)
+        return {
+            "ok": True,
+            "removed_work_ids": removed,
+            "tab": self.build_cloud_local_tab(field_id, "research_tasks", model_mode="all", sync_state="unsynced", limit=1000),
+        }
+
+    def clear_cloud_queue(self, field_id: str = "cloud-crawl") -> dict[str, Any]:
+        cleared = 0
+        for work in self._v2_project_records_fast(field_id, "source_works"):
+            work_id = str(work.get("work_id") or "")
+            if not work_id:
+                continue
+            generic_state = self._cloud_generic_queue_state(work)
+            if generic_state != "removed" and (generic_state or str(work.get("cloud_local_origin") or "") == "cloud_crawl"):
+                self._set_cloud_work_research_state(work_id, "removed", model_mode="all", message="Cleared from queued papers.")
+                cleared += 1
+        return {"ok": True, "cleared": cleared, "counts": self.cloud_local_counts(field_id, model_mode="all")}
+
+    def clear_cloud_research_tasks(self, field_id: str = "cloud-crawl", *, model_mode: str = "auto") -> dict[str, Any]:
+        cleared = 0
+        for work in self._v2_project_records_fast(field_id, "source_works"):
+            work_id = str(work.get("work_id") or "")
+            if not work_id:
+                continue
+            work = self.store.get_item("source_works", work_id) or work
+            task_state = self._cloud_work_task_state(work)
+            if task_state == "researching":
+                continue
+            if task_state in {"research_task", "done", "failed", "stopped", "metadata_only"}:
+                self._set_cloud_work_task_state(work_id, "removed", model_mode=model_mode, message="Cleared from research tasks.")
+                cleared += 1
+        return {"ok": True, "cleared": cleared, "counts": self.cloud_local_counts(field_id, model_mode="all")}
 
     def sync_cloud_legacy_records_for_upload(
         self,
@@ -2880,6 +4080,11 @@ class PrincipiaEngine:
             work = self.store.get_item("source_works", work_id)
             if not work:
                 continue
+            if not compact_text(work.get("abstract") or "", 20) and (work.get("url_or_doi") or work.get("source_urls")):
+                recovered = self._recover_candidate_abstracts([dict(work)])[0]
+                if compact_text(recovered.get("abstract") or "", 20):
+                    work.update(recovered)
+                    self.store.upsert("source_works", work, "work_id")
             saved = self.global_store.upsert_work(work)
             global_work_id = str(saved.get("work_id") or "")
             if not global_work_id:
@@ -2903,7 +4108,7 @@ class PrincipiaEngine:
                 run_id = str(run.get("extraction_run_id") or "")
             else:
                 run_id = ""
-            counts = self.v2_work_extraction_counts(legacy_work_id)
+            counts = self.v2_work_extraction_counts(legacy_work_id, model_mode=model_mode)
             if run_id:
                 self.global_store.complete_extraction_run(run_id, result=counts)
             concepts_synced += self._sync_cloud_legacy_concepts_for_upload(
@@ -2941,6 +4146,8 @@ class PrincipiaEngine:
             for item in self._v2_project_records_fast(field_id, bucket):
                 source_ids = set(self._cloud_record_work_ids(bucket, item))
                 if legacy_work_id not in source_ids:
+                    continue
+                if not self._v2_record_has_model_variant(item, model):
                     continue
                 payload = dict(item)
                 payload["source_work_ids"] = [global_work_id]
@@ -3001,26 +4208,41 @@ class PrincipiaEngine:
         contribution_path: str = "",
         upload_id: str = "",
         status: str = "synced",
+        model_mode: str = "auto",
     ) -> dict[str, Any]:
         now = utc_now()
         updated: dict[str, int] = {"source_works": 0}
         unique_work_ids = self._ordered_unique([str(work_id) for work_id in work_ids if work_id])
+        model_key = self._cloud_model_key(model_mode)
         for work_id in unique_work_ids:
             work = self.store.get_item("source_works", work_id)
             if not work:
                 continue
+            sync_by_model = work.get("cloud_sync_by_model") if isinstance(work.get("cloud_sync_by_model"), dict) else {}
+            sync_by_model[model_key] = {
+                "status": status,
+                "model_mode": model_mode or "auto",
+                "model_key": model_key,
+                "synced_at": now,
+                "contribution_path": contribution_path,
+                "upload_id": upload_id,
+            }
             work.update(
                 {
                     "cloud_sync_status": status,
                     "cloud_synced_at": now,
                     "cloud_contribution_path": contribution_path,
                     "cloud_upload_id": upload_id,
+                    "cloud_sync_model_key": model_key,
+                    "cloud_sync_by_model": sync_by_model,
                     "cloud_research_state": "synced" if status == "synced" else work.get("cloud_research_state", ""),
                     "cloud_research_message": "Synced to cloud." if status == "synced" else work.get("cloud_research_message", ""),
                     "cloud_research_updated_at": now,
                 }
             )
             self.store.upsert("source_works", work, "work_id")
+            if status == "synced":
+                self._set_cloud_work_research_state(work_id, "synced", model_mode=model_mode, message="Synced to cloud.")
             updated["source_works"] += 1
         work_sync = self._cloud_work_sync_map(field_id)
         for bucket in ("existed_ideas", "principles", "takeaway_messages", "benchmark_records", "baseline_records"):
@@ -3031,18 +4253,29 @@ class PrincipiaEngine:
                 if not ids.intersection(unique_work_ids):
                     continue
                 if ids and all(work_sync.get(work_id) == "synced" or work_id in unique_work_ids for work_id in ids):
+                    sync_by_model = item.get("cloud_sync_by_model") if isinstance(item.get("cloud_sync_by_model"), dict) else {}
+                    sync_by_model[model_key] = {
+                        "status": status,
+                        "model_mode": model_mode or "auto",
+                        "model_key": model_key,
+                        "synced_at": now,
+                        "contribution_path": contribution_path,
+                        "upload_id": upload_id,
+                    }
                     item.update(
                         {
                             "cloud_sync_status": status,
                             "cloud_synced_at": now,
                             "cloud_contribution_path": contribution_path,
                             "cloud_upload_id": upload_id,
+                            "cloud_sync_model_key": model_key,
+                            "cloud_sync_by_model": sync_by_model,
                         }
                     )
                     self.store.upsert(bucket, item, id_key)
                     changed += 1
             updated[bucket] = changed
-        return {"ok": True, "updated": updated, "work_ids": unique_work_ids, "counts": self.cloud_local_counts(field_id)}
+        return {"ok": True, "updated": updated, "work_ids": unique_work_ids, "counts": self.cloud_local_counts(field_id, model_mode=model_mode)}
 
     def clear_cloud_synced_cache(self, field_id: str = "cloud-crawl") -> dict[str, Any]:
         work_sync = self._cloud_work_sync_map(field_id)
@@ -3153,10 +4386,85 @@ class PrincipiaEngine:
                 else:
                     items = []
         if query:
-            items = [item for item in items if lexical_score(query, self._v2_searchable_text(item)) > 0]
+            needle = str(query or "").strip().lower()
+            matched = []
+            for item in items:
+                body = self._v2_searchable_text(item)
+                if lexical_score(query, body) > 0 or (needle and needle in body.lower()):
+                    matched.append(item)
+            items = matched
         if bucket == "benchmark_records":
             items = [item for item in items if self._v2_is_official_benchmark_record(item)]
         return items
+
+    def _v2_dedupe_presented_project_records(self, bucket: str, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        bucket = self._v2_bucket(bucket)
+        if bucket in {"source_works", "my_ideas"}:
+            return items
+
+        def record_key(item: dict[str, Any]) -> str:
+            if bucket == "existed_ideas":
+                title = item.get("title") or item.get("name") or ""
+                body = item.get("core_idea") or item.get("idea_text") or item.get("summary") or item.get("mechanism") or ""
+                return "xi:" + (self._v2_canonical_key(title) or self._v2_argument_key(body))
+            if bucket == "principles":
+                title = item.get("name") or item.get("title") or ""
+                body = item.get("argument") or item.get("abstract_signature") or item.get("summary") or item.get("mechanism") or ""
+                return "p:" + (self._v2_canonical_key(title) or self._v2_argument_key(body))
+            if bucket == "takeaway_messages":
+                title = item.get("title") or item.get("name") or ""
+                body = item.get("main_results") or item.get("message_text") or item.get("finding") or item.get("summary") or ""
+                return "tm:" + (self._v2_canonical_key(title) or self._v2_argument_key(body))
+            if bucket == "benchmark_records":
+                title = item.get("benchmark_name") or item.get("name") or item.get("title") or ""
+                task = item.get("task") or item.get("description") or ""
+                return "b:" + (self._v2_canonical_key(title) or self._v2_argument_key(task))
+            if bucket == "baseline_records":
+                title = item.get("baseline_name") or item.get("name") or item.get("title") or ""
+                body = item.get("core_idea") or item.get("methodology") or item.get("description") or item.get("principle") or ""
+                return "bl:" + (self._v2_canonical_key(title) or self._v2_argument_key(body))
+            id_key = self._record_id_key(bucket)
+            return f"{bucket}:{item.get(id_key) or self._v2_argument_key(self._v2_searchable_text(item))}"
+
+        def quality_score(item: dict[str, Any]) -> tuple[int, int, str]:
+            source_ids = item.get("source_work_ids") or item.get("source_works") or []
+            text_fields = [
+                str(item.get(key) or "")
+                for key in (
+                    "title",
+                    "name",
+                    "core_idea",
+                    "idea_text",
+                    "argument",
+                    "abstract_signature",
+                    "main_results",
+                    "message_text",
+                    "mechanism",
+                    "methodology",
+                    "discussion",
+                    "evidence",
+                )
+            ]
+            return (
+                len([source_id for source_id in source_ids if source_id]),
+                sum(len(value.strip()) for value in text_fields),
+                str(item.get("updated_at") or item.get("extracted_at") or item.get("created_at") or ""),
+            )
+
+        ordered_keys: list[str] = []
+        best_by_key: dict[str, dict[str, Any]] = {}
+        for item in items:
+            key = record_key(item)
+            if not key or key.endswith(":"):
+                id_key = self._record_id_key(bucket)
+                key = f"{bucket}:{item.get(id_key) or json.dumps(item, sort_keys=True, ensure_ascii=False)[:180]}"
+            if key not in best_by_key:
+                ordered_keys.append(key)
+                best_by_key[key] = item
+                continue
+            if quality_score(item) > quality_score(best_by_key[key]):
+                best_by_key[key] = item
+        return [best_by_key[key] for key in ordered_keys]
 
     def _v2_record_matches_work_scope(self, item: dict[str, Any], work_ids: set[str], field_id: str) -> bool:
         if item.get("field_id") == field_id:
@@ -3206,9 +4514,15 @@ class PrincipiaEngine:
                 return int(year)
         return 0
 
-    def v2_item_detail(self, bucket: str, record_id: str, *, version: str = "", model_mode: str = "auto") -> dict[str, Any]:
+    def v2_item_detail(self, bucket: str, record_id: str, *, version: str = "", model_mode: str = "auto", field_id: str = "") -> dict[str, Any]:
         bucket = self._v2_bucket(bucket)
+        if bucket == "source_works":
+            self._v2_ensure_project_cloud_hydration(field_id or "default", model_mode=model_mode, work_ids=[record_id])
         item = self.store.get_item(bucket, record_id)
+        if not item:
+            concept = self.global_store.get_concept(record_id)
+            if concept:
+                item = self._v2_item_from_global_concept(concept, bucket)
         if not item:
             raise KeyError(f"{bucket}:{record_id} not found")
         detail = self._v2_present_item(item, model_mode=model_mode, version_id=version)
@@ -3221,7 +4535,236 @@ class PrincipiaEngine:
             for link in data.get("evidence_links", {}).values()
             if link.get("target_bucket") == bucket and link.get("target_id") == record_id
         ]
+        if bucket == "source_works":
+            detail["work_extractions"] = self._v2_work_extraction_groups(record_id, model_mode=model_mode)
         return {"item": detail}
+
+    def _v2_item_from_global_concept(self, concept: dict[str, Any], bucket: str) -> dict[str, Any]:
+        concept_id = str(concept.get("concept_id") or "")
+        payload = dict(concept.get("payload") or (concept.get("active_version") or {}).get("payload") or {})
+        active_version = dict(concept.get("active_version") or {})
+        version_id = str(active_version.get("concept_version_id") or concept.get("active_version_id") or stable_id("VER", concept_id, "global"))
+        id_key = self._record_id_key(bucket)
+        if id_key:
+            payload[id_key] = concept_id
+        payload.setdefault("canonical_id", concept_id)
+        if bucket == "principles":
+            payload.setdefault("name", concept.get("canonical_label") or payload.get("name") or payload.get("title") or concept_id)
+        elif bucket == "existed_ideas":
+            payload.setdefault("title", concept.get("canonical_label") or payload.get("title") or concept_id)
+            payload.setdefault("idea_text", payload.get("core_idea") or payload.get("summary") or active_version.get("summary_text") or "")
+        elif bucket == "takeaway_messages":
+            payload.setdefault("title", concept.get("canonical_label") or payload.get("title") or concept_id)
+            payload.setdefault("message_text", payload.get("main_results") or payload.get("summary") or active_version.get("summary_text") or "")
+        else:
+            payload.setdefault("title", concept.get("canonical_label") or payload.get("title") or payload.get("name") or concept_id)
+        return {
+            **payload,
+            id_key: concept_id,
+            "canonical_id": concept_id,
+            "canonical_key": concept.get("canonical_key", ""),
+            "active_version_id": version_id,
+            "created_at": concept.get("created_at", ""),
+            "updated_at": concept.get("updated_at", ""),
+            "variants": {
+                version_id: {
+                    "version_id": version_id,
+                    "model_mode": active_version.get("model_mode", ""),
+                    "model_name": active_version.get("llm_model", ""),
+                    "provider": active_version.get("llm_provider", ""),
+                    "extracted_at": active_version.get("created_at", concept.get("updated_at", "")),
+                    "confidence_score": active_version.get("quality_score", concept.get("confidence_score", 0)),
+                    "is_user_edit": bool(active_version.get("is_manual_edit", False)),
+                    "payload": payload,
+                }
+            },
+        }
+
+    def _v2_work_identity_match_keys(self, work: dict[str, Any]) -> set[str]:
+        keys = candidate_identity_keys(work or {})
+        strong = {
+            f"{name}:{keys[name]}"
+            for name in ("doi", "arxiv_id", "openreview_forum_id", "openalex_id", "semantic_scholar_id", "crossref_id")
+            if keys.get(name)
+        }
+        if strong:
+            return strong
+        if keys.get("title_hash"):
+            return {f"title_hash:{keys['title_hash']}"}
+        title = normalize_title(str(keys.get("canonical_title") or ""))
+        return {f"title_norm:{title}"} if title else set()
+
+    def _v2_equivalent_work_ids(self, work_id: str) -> list[str]:
+        work_id = str(work_id or "")
+        work = self.store.get_item("source_works", work_id) if work_id else None
+        if not work:
+            return [work_id] if work_id else []
+        target_keys = self._v2_work_identity_match_keys(work)
+        if not target_keys:
+            return [work_id]
+        equivalents = [work_id]
+        for candidate in self.store.list_items("source_works", limit=100000):
+            candidate_id = str(candidate.get("work_id") or "")
+            if not candidate_id or candidate_id == work_id:
+                continue
+            if target_keys & self._v2_work_identity_match_keys(candidate):
+                equivalents.append(candidate_id)
+        return self._ordered_unique(equivalents)
+
+    def _v2_equivalent_work_ids_many(self, work_ids: list[str]) -> dict[str, list[str]]:
+        unique = self._ordered_unique([str(work_id) for work_id in work_ids if work_id])
+        if not unique:
+            return {}
+        requested = {work_id: self.store.get_item("source_works", work_id) for work_id in unique}
+        requested_keys = {
+            work_id: self._v2_work_identity_match_keys(work or {})
+            for work_id, work in requested.items()
+        }
+        all_keys = {key for keys in requested_keys.values() for key in keys}
+        output = {work_id: [work_id] for work_id in unique}
+        if not all_keys:
+            return output
+        for candidate in self.store.list_items("source_works", limit=100000):
+            candidate_id = str(candidate.get("work_id") or "")
+            if not candidate_id:
+                continue
+            candidate_keys = self._v2_work_identity_match_keys(candidate)
+            if not candidate_keys or not (candidate_keys & all_keys):
+                continue
+            for work_id, keys in requested_keys.items():
+                if keys and (keys & candidate_keys):
+                    output.setdefault(work_id, [work_id]).append(candidate_id)
+        return {work_id: self._ordered_unique(ids) for work_id, ids in output.items()}
+
+    def _v2_evidence_links_for_equivalent_work(self, work_id: str) -> list[dict[str, Any]]:
+        links: list[dict[str, Any]] = []
+        equivalent_ids = self._v2_equivalent_work_ids(work_id)
+        for equivalent_id in equivalent_ids:
+            links.extend(self.store.list_evidence_links_for_source(equivalent_id))
+        seen = {
+            (str(link.get("target_bucket") or ""), str(link.get("target_id") or ""))
+            for link in links
+            if link.get("target_bucket") and link.get("target_id")
+        }
+        equivalent_id_set = set(equivalent_ids)
+        equivalent_titles = self._v2_equivalent_work_titles(equivalent_ids)
+        for bucket in ("existed_ideas", "principles", "takeaway_messages", "benchmark_records", "baseline_records"):
+            id_key = self._record_id_key(bucket)
+            for item in self.store.list_items(bucket, limit=100000):
+                target_id = str(item.get(id_key) or item.get("canonical_id") or "")
+                key = (bucket, target_id)
+                if not target_id or key in seen:
+                    continue
+                if not self._v2_record_points_to_equivalent_work(bucket, item, equivalent_id_set, equivalent_titles):
+                    continue
+                links.append(
+                    {
+                        "link_id": stable_id("EL", "synthetic", bucket, target_id, work_id),
+                        "field_id": "",
+                        "target_bucket": bucket,
+                        "target_id": target_id,
+                        "source_bucket": "source_works",
+                        "source_id": work_id,
+                        "evidence": item.get("evidence") or item.get("abstract_signature") or item.get("summary") or "",
+                        "cloud_origin": item.get("cloud_origin") or {},
+                    }
+                )
+                seen.add(key)
+        return links
+
+    def _v2_equivalent_work_titles(self, work_ids: list[str]) -> set[str]:
+        titles: set[str] = set()
+        for equivalent_id in work_ids:
+            work = self.store.get_item("source_works", equivalent_id)
+            if not work:
+                continue
+            for key in ("title", "canonical_title", "source_title"):
+                title = normalize_title(str(work.get(key) or ""))
+                if title:
+                    titles.add(title)
+        return titles
+
+    def _v2_record_linked_work_ids(self, bucket: str, item: dict[str, Any]) -> list[str]:
+        ids = list(self._cloud_record_work_ids(bucket, item))
+        for variant in (item.get("variants") or {}).values():
+            payload = variant.get("payload") if isinstance(variant, dict) else {}
+            if isinstance(payload, dict):
+                ids.extend(self._cloud_record_work_ids(bucket, payload))
+        return self._ordered_unique(ids)
+
+    def _v2_record_source_titles(self, item: dict[str, Any]) -> set[str]:
+        titles: set[str] = set()
+        sources = [item]
+        for variant in (item.get("variants") or {}).values():
+            payload = variant.get("payload") if isinstance(variant, dict) else {}
+            if isinstance(payload, dict):
+                sources.append(payload)
+        for source in sources:
+            for key in ("source_work_title", "source_paper_title", "paper_title", "work_title", "problem_pressure"):
+                title = normalize_title(str(source.get(key) or ""))
+                if title:
+                    titles.add(title)
+        return titles
+
+    def _v2_record_points_to_equivalent_work(self, bucket: str, item: dict[str, Any], equivalent_ids: set[str], equivalent_titles: set[str]) -> bool:
+        linked_ids = set(self._v2_record_linked_work_ids(bucket, item))
+        if linked_ids & equivalent_ids:
+            return True
+        for linked_id in linked_ids:
+            linked_work = self.store.get_item("source_works", linked_id)
+            if not linked_work:
+                continue
+            linked_titles = self._v2_equivalent_work_titles([linked_id])
+            if linked_titles & equivalent_titles:
+                return True
+        return bool(equivalent_titles and (self._v2_record_source_titles(item) & equivalent_titles))
+
+    def _v2_work_extraction_groups(self, work_id: str, *, model_mode: str = "auto") -> dict[str, Any]:
+        work_id = str(work_id or "")
+        buckets = {
+            "existed_ideas": "Existed Ideas",
+            "principles": "Principles",
+            "benchmark_records": "Benchmarks",
+            "baseline_records": "Baselines",
+            "takeaway_messages": "Takeaways",
+        }
+        output = {
+            bucket: {"label": label, "items": [], "total": 0}
+            for bucket, label in buckets.items()
+        }
+        if not work_id:
+            return {"model_mode": model_mode or "auto", "groups": output, "total": 0}
+        target_model = self._v2_model_meta(model_mode) if model_mode and str(model_mode) not in {"all", "auto"} else {}
+        seen: set[tuple[str, str]] = set()
+        for link in self._v2_evidence_links_for_equivalent_work(work_id):
+            bucket = str(link.get("target_bucket") or "")
+            target_id = str(link.get("target_id") or "")
+            key = (bucket, target_id)
+            if bucket not in output or not target_id or key in seen:
+                continue
+            item = self.store.get_item(bucket, target_id)
+            if not item:
+                continue
+            if target_model and not self._v2_record_has_model_variant(item, target_model):
+                continue
+            seen.add(key)
+            presented = self._v2_present_item(item, model_mode=model_mode, compact=True)
+            presented["detail_bucket"] = bucket
+            presented["detail_id"] = target_id
+            output[bucket]["items"].append(presented)
+        total = 0
+        for group in output.values():
+            group["items"].sort(
+                key=lambda item: (
+                    float(item.get("confidence_score") or 0),
+                    str(item.get("extracted_at") or item.get("updated_at") or ""),
+                    str(item.get("title") or item.get("name") or item.get("benchmark_name") or item.get("baseline_name") or ""),
+                ),
+                reverse=True,
+            )
+            group["total"] = len(group["items"])
+            total += group["total"]
+        return {"model_mode": model_mode or "auto", "groups": output, "total": total}
 
     def v2_item_update(self, payload: dict[str, Any]) -> dict[str, Any]:
         bucket = self._v2_bucket(str(payload.get("bucket") or ""))
@@ -3248,19 +4791,153 @@ class PrincipiaEngine:
         updated = self._v2_upsert_canonical(bucket, item.get("canonical_key") or record_id, refreshed, model_mode=model_mode, existing_id=record_id)
         return {"ok": True, "item": self._v2_present_item(updated, model_mode=model_mode)}
 
-    def v2_work_extraction_counts(self, work_id: str) -> dict[str, int]:
+    def v2_work_extraction_counts(self, work_id: str, *, model_mode: str = "") -> dict[str, int]:
         work_id = str(work_id or "")
         counts: dict[str, int] = {bucket: 0 for bucket in ("existed_ideas", "principles", "takeaway_messages", "benchmark_records", "baseline_records")}
         seen: set[tuple[str, str]] = set()
-        for link in self.store.list_evidence_links_for_source(work_id):
+        target_model = self._v2_model_meta(model_mode) if model_mode and str(model_mode) not in {"all", "auto"} else {}
+        for link in self._v2_evidence_links_for_equivalent_work(work_id):
             bucket = str(link.get("target_bucket") or "")
             target_id = str(link.get("target_id") or "")
             if bucket not in counts or not target_id or (bucket, target_id) in seen:
                 continue
+            if target_model:
+                item = self.store.get_item(bucket, target_id)
+                if not item or not self._v2_record_has_model_variant(item, target_model):
+                    continue
             seen.add((bucket, target_id))
             counts[bucket] += 1
         counts["total"] = sum(counts.values())
         return counts
+
+    def _v2_work_extraction_count_map(self, work_ids: list[str], *, model_mode: str = "") -> dict[str, dict[str, int]]:
+        unique_work_ids = self._ordered_unique([str(work_id) for work_id in work_ids if work_id])
+        buckets = ("existed_ideas", "principles", "takeaway_messages", "benchmark_records", "baseline_records")
+        output: dict[str, dict[str, int]] = {work_id: {bucket: 0 for bucket in buckets} for work_id in unique_work_ids}
+        if not unique_work_ids:
+            return output
+        equivalent_by_work = self._v2_equivalent_work_ids_many(unique_work_ids)
+        owners_by_source: dict[str, list[str]] = {}
+        for owner_id, equivalent_ids in equivalent_by_work.items():
+            for equivalent_id in equivalent_ids:
+                owners_by_source.setdefault(equivalent_id, []).append(owner_id)
+        query_work_ids = self._ordered_unique([source_id for ids in equivalent_by_work.values() for source_id in ids])
+        target_model = self._v2_model_meta(model_mode) if model_mode and str(model_mode) not in {"all", "auto"} else {}
+        links: list[dict[str, Any]] = []
+        with self.store._lock, self.store._connect() as conn:
+            for index in range(0, len(query_work_ids), 300):
+                chunk = query_work_ids[index : index + 300]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"""
+                    SELECT payload FROM records
+                    WHERE bucket = 'evidence_links'
+                    AND json_extract(payload, '$.source_id') IN ({placeholders})
+                    """,
+                    chunk,
+                ).fetchall()
+                links.extend(json.loads(row["payload"]) for row in rows)
+        target_ids_by_bucket: dict[str, set[str]] = {bucket: set() for bucket in buckets}
+        for link in links:
+            bucket = str(link.get("target_bucket") or "")
+            target_id = str(link.get("target_id") or "")
+            if bucket in target_ids_by_bucket and target_id:
+                target_ids_by_bucket[bucket].add(target_id)
+        target_items: dict[tuple[str, str], dict[str, Any]] = {}
+        if target_model:
+            for bucket, ids in target_ids_by_bucket.items():
+                for item in self.store.get_items_by_ids(bucket, list(ids)):
+                    record_id = str(item.get(self._record_id_key(bucket)) or item.get("canonical_id") or "")
+                    if record_id:
+                        target_items[(bucket, record_id)] = item
+        seen: set[tuple[str, str, str]] = set()
+        for link in links:
+            source_id = str(link.get("source_id") or "")
+            bucket = str(link.get("target_bucket") or "")
+            target_id = str(link.get("target_id") or "")
+            if bucket not in buckets or not target_id:
+                continue
+            if target_model:
+                item = target_items.get((bucket, target_id))
+                if not item or not self._v2_record_has_model_variant(item, target_model):
+                    continue
+            for owner_id in owners_by_source.get(source_id, []):
+                if owner_id not in output:
+                    continue
+                key = (owner_id, bucket, target_id)
+                if key in seen:
+                    continue
+                seen.add(key)
+                output[owner_id][bucket] += 1
+        work_title_cache: dict[str, set[str]] = {}
+        for work in self.store.get_items_by_ids("source_works", query_work_ids):
+            work_id = str(work.get("work_id") or "")
+            if not work_id:
+                continue
+            titles = {
+                normalize_title(str(work.get(key) or ""))
+                for key in ("title", "canonical_title", "source_title")
+                if normalize_title(str(work.get(key) or ""))
+            }
+            work_title_cache[work_id] = titles
+        equivalent_titles = {
+            owner_id: {
+                title
+                for equivalent_id in equivalent_by_work.get(owner_id, [])
+                for title in work_title_cache.get(equivalent_id, set())
+            }
+            for owner_id in unique_work_ids
+        }
+        equivalent_sets = {
+            owner_id: set(equivalent_by_work.get(owner_id, []))
+            for owner_id in unique_work_ids
+        }
+        for bucket in buckets:
+            id_key = self._record_id_key(bucket)
+            for item in self.store.list_items(bucket, limit=100000):
+                target_id = str(item.get(id_key) or item.get("canonical_id") or "")
+                if not target_id:
+                    continue
+                if target_model and not self._v2_record_has_model_variant(item, target_model):
+                    continue
+                linked_ids = set(self._v2_record_linked_work_ids(bucket, item))
+                source_titles = self._v2_record_source_titles(item)
+                for owner_id in unique_work_ids:
+                    key = (owner_id, bucket, target_id)
+                    if key in seen:
+                        continue
+                    if not (
+                        linked_ids & equivalent_sets.get(owner_id, set())
+                        or (source_titles and source_titles & equivalent_titles.get(owner_id, set()))
+                    ):
+                        continue
+                    seen.add(key)
+                    output[owner_id][bucket] += 1
+        for counts in output.values():
+            counts["total"] = sum(counts.get(bucket, 0) for bucket in buckets)
+        return output
+
+    def _v2_record_has_model_variant(self, item: dict[str, Any], target_model: dict[str, str]) -> bool:
+        if not target_model:
+            return True
+        for variant in (item.get("variants") or {}).values():
+            if (
+                str(variant.get("model_mode") or "") == str(target_model.get("model_mode") or "")
+                and str(variant.get("provider") or "") == str(target_model.get("provider") or "")
+                and str(variant.get("model_name") or "") == str(target_model.get("model_name") or "")
+            ):
+                return True
+        return (
+            str(item.get("model_mode") or "") == str(target_model.get("model_mode") or "")
+            and (
+                not item.get("provider")
+                or str(item.get("provider") or "") == str(target_model.get("provider") or "")
+            )
+            and (
+                not item.get("model_name")
+                or str(item.get("model_name") or "") == str(target_model.get("model_name") or "")
+            )
+        )
 
     def v2_active_work_extraction_runs(self, field_id: str = "") -> dict[str, dict[str, Any]]:
         active = {"queued", "running"}
@@ -3308,7 +4985,7 @@ class PrincipiaEngine:
         work = self.store.get_item("source_works", work_id)
         if not work:
             raise KeyError(f"source_works:{work_id} not found")
-        existing = self.v2_work_extraction_counts(work_id)
+        existing = self.v2_work_extraction_counts(work_id, model_mode=model_mode)
         has_core_coverage = (
             existing.get("existed_ideas", 0) > 0
             and existing.get("principles", 0) > 0
@@ -3333,7 +5010,7 @@ class PrincipiaEngine:
                     project_id=field_id,
                 )[0]
                 if not decision.get("should_extract"):
-                    counts = self.v2_work_extraction_counts(work_id)
+                    counts = self.v2_work_extraction_counts(work_id, model_mode=model_mode)
                     return {"ok": True, "cloud_cache_hit": True, "decision": decision, "counts": counts, "work": work}
             except Exception as exc:
                 update("cloud_lookup_skipped", f"Cloud lookup was skipped and local extraction will continue: {exc}", work_id=work_id)
@@ -3448,7 +5125,7 @@ class PrincipiaEngine:
             if int(latest.get("existed_ideas") or 0) >= 5 and int(latest.get("baselines") or latest.get("baseline_records") or 0) >= 2:
                 break
             stored_work = self._v2_upsert_work(raw_work, model_mode="metadata")
-            existing = self.v2_work_extraction_counts(stored_work["work_id"])
+            existing = self.v2_work_extraction_counts(stored_work["work_id"], model_mode=model_mode)
             has_core_coverage = (
                 existing.get("existed_ideas", 0) > 0
                 and existing.get("principles", 0) > 0
@@ -3571,7 +5248,7 @@ class PrincipiaEngine:
         self._update_run_progress(run_id, "related_comparison", "Checking nearby extracted ideas with a bounded LLM comparison.", result_idea_id=stored["idea_id"])
         try:
             existed = [self._v2_present_item(item, model_mode=model_mode) for item in self._v2_project_records(data, field_id, "existed_ideas")]
-            related_rows = self._v2_related_existed_ideas(idea, existed, model_mode=model_mode, limit=8, timeout_seconds=70) or idea.get("related_existed_ideas") or []
+            related_rows = self._v2_dedupe_related_rows(self._v2_related_existed_ideas(idea, existed, model_mode=model_mode, limit=8, timeout_seconds=70) or idea.get("related_existed_ideas") or [])
             if related_rows and not self._v2_rows_are_repetitive(related_rows):
                 stored["related_existed_ideas"] = related_rows
                 stored = self._v2_store_my_idea_version(stored, stored, model_mode=model_mode, idea_id=stored["idea_id"])
@@ -3633,7 +5310,7 @@ class PrincipiaEngine:
         self._update_run_progress(run_id, "related_comparison", "Checking nearby extracted ideas with a bounded LLM comparison.", result_idea_id=idea_id)
         try:
             existed = [self._v2_present_item(item, model_mode=model_mode) for item in self._v2_project_records(data, field_id, "existed_ideas")]
-            related_rows = self._v2_related_existed_ideas(idea, existed, model_mode=model_mode, limit=8, timeout_seconds=70) or idea.get("related_existed_ideas") or []
+            related_rows = self._v2_dedupe_related_rows(self._v2_related_existed_ideas(idea, existed, model_mode=model_mode, limit=8, timeout_seconds=70) or idea.get("related_existed_ideas") or [])
             if related_rows and not self._v2_rows_are_repetitive(related_rows):
                 stored["related_existed_ideas"] = related_rows
                 stored = self._v2_store_my_idea_version(stored, stored, model_mode=model_mode, idea_id=idea_id)
@@ -3699,6 +5376,7 @@ class PrincipiaEngine:
                     prior_ideas=len(candidates),
                     related_rows=len(related_rows),
                 )
+        related_rows = self._v2_dedupe_related_rows(related_rows)
         if not related_rows or self._v2_rows_are_repetitive(related_rows):
             provider_error = str(getattr(self, "_last_v2_related_error", "") or "")
             if provider_error:
@@ -3753,7 +5431,7 @@ class PrincipiaEngine:
             raise KeyError(f"my_ideas:{idea_id} not found")
         materialized = self._v2_materialize_my_idea_versions(existing)
         current = self._v2_present_item(materialized, model_mode=model_mode, version_id=version)
-        related_rows = [row for row in (current.get("related_existed_ideas") or []) if isinstance(row, dict)]
+        related_rows = self._v2_dedupe_related_rows([row for row in (current.get("related_existed_ideas") or []) if isinstance(row, dict)])
         if not related_rows:
             raise RuntimeError("Generate related-ideas comparison first; redesign needs comparison rows to improve against.")
         profile = self._ensure_field_profile(field_id, current.get("novelty_claim") or "")
@@ -3822,15 +5500,17 @@ class PrincipiaEngine:
             for row in (presented_idea.get("related_existed_ideas") or [])
             if isinstance(row, dict) and not self._v2_related_row_is_template(row)
         ]
+        cached_related = self._v2_dedupe_related_rows(cached_related)
         related = [] if self._v2_rows_are_repetitive(cached_related) else cached_related
         principles = [self._v2_present_item(item, model_mode=model_mode) for item in self._v2_project_records(data, field_id, "principles")]
         active_variant = presented_idea.get("active_variant") or {}
+        repaired_idea = self._v2_repair_my_idea_payload(presented_idea)
         return {
             "project": data.get("field_profiles", {}).get(field_id) or {},
-            "idea": self._v2_repair_my_idea_payload(presented_idea),
+            "idea": repaired_idea,
             "related_existed_ideas": related,
-            "principle_map": self._v2_principle_map(presented_idea, principles, related),
-            "source_evidence": self._v2_my_idea_sources(presented_idea, data, model_mode=model_mode),
+            "principle_map": self._v2_principle_map(repaired_idea, principles, related),
+            "source_evidence": self._v2_my_idea_sources(repaired_idea, data, model_mode=model_mode),
             "reference_labels": self._v2_reference_labels(data, model_mode=model_mode),
             "comparison_warning": "" if related else (
                 "No high-quality LLM comparison is available for this idea version. "
@@ -3933,6 +5613,10 @@ class PrincipiaEngine:
         return f"{safe_title}.md", content.encode("utf-8"), "text/markdown; charset=utf-8"
 
     def _v2_model_meta(self, model_mode: str) -> dict[str, str]:
+        if str(model_mode or "").strip() == "all":
+            return {"model_mode": "all", "provider": "all", "model_name": "All LLMs"}
+        if str(model_mode or "").strip() == "metadata":
+            return {"model_mode": "metadata", "provider": "metadata", "model_name": "metadata"}
         try:
             resolved = self.llm.resolve_model(mode=model_mode)
         except Exception:
@@ -4002,9 +5686,29 @@ class PrincipiaEngine:
 
     def _v2_upsert_work(self, work: dict[str, Any], *, model_mode: str) -> dict[str, Any]:
         title = compact_text(work.get("title") or "Untitled work", 240)
-        payload = {
+        preserve_work_id = bool(work.get("preserve_work_id") or work.get("cloud_preserve_work_id"))
+        payload = self._v2_work_payload(work, title=title)
+        return self._v2_upsert_canonical(
+            "source_works",
+            title,
+            payload,
+            model_mode=model_mode,
+            existing_id=work.get("work_id") or "",
+            preserve_existing_id=preserve_work_id,
+        )
+
+    def _v2_work_payload(self, work: dict[str, Any], *, title: str = "") -> dict[str, Any]:
+        title = title or compact_text(work.get("title") or "Untitled work", 240)
+        return {
             "title": title,
             "authors": work.get("authors") or [],
+            "author_names": work.get("author_names") or [],
+            "authors_text": work.get("authors_text") or work.get("author_text") or "",
+            "affiliations": work.get("affiliations") or work.get("institutions") or [],
+            "institutions": work.get("institutions") or [],
+            "affiliations_text": work.get("affiliations_text") or work.get("affiliation_text") or "",
+            "keywords": work.get("keywords") or [],
+            "topics": work.get("topics") or [],
             "year": work.get("year"),
             "venue_or_source": work.get("venue_or_source") or work.get("source_type") or "online",
             "url_or_doi": work.get("url_or_doi") or "",
@@ -4029,14 +5733,181 @@ class PrincipiaEngine:
             "priority_reason": work.get("priority_reason") or "",
             "cloud_crawl_query": work.get("cloud_crawl_query") or "",
         }
-        return self._v2_upsert_canonical("source_works", title, payload, model_mode=model_mode, existing_id=work.get("work_id") or "")
 
-    def _v2_needs_llm_extraction(self, work: dict[str, Any], model_mode: str) -> bool:
+    def _v2_prepare_research_works_batch(
+        self,
+        works: list[dict[str, Any]],
+        *,
+        cloud_hits_by_candidate: dict[str, dict[str, Any]] | None = None,
+        model_mode: str = "metadata",
+    ) -> list[dict[str, Any]]:
+        cloud_hits_by_candidate = cloud_hits_by_candidate or {}
+        prepared_slots: list[dict[str, Any]] = []
+        write_candidates: list[dict[str, Any]] = []
+        hydrated_ids: list[str] = []
+        for raw_work in works:
+            raw_work_id = str(raw_work.get("work_id") or "")
+            cloud_decision = cloud_hits_by_candidate.get(raw_work_id) or {}
+            hydrated_work_id = str(cloud_decision.get("work_id") or "")
+            if hydrated_work_id:
+                hydrated_ids.append(hydrated_work_id)
+                prepared_slots.append({"raw_work": raw_work, "hydrated_work_id": hydrated_work_id})
+            elif raw_work_id and raw_work.get("canonical_key"):
+                prepared_slots.append({"raw_work": raw_work, "ready_work": raw_work})
+            else:
+                title = compact_text(raw_work.get("title") or "Untitled work", 240)
+                canonical_key = self._v2_canonical_key(title)
+                existing_id = str(raw_work.get("work_id") or "")
+                write_candidates.append(
+                    {
+                        "raw_work": raw_work,
+                        "title": title,
+                        "payload": self._v2_work_payload(raw_work, title=title),
+                        "canonical_key": canonical_key,
+                        "existing_id": existing_id,
+                        "preserve_existing_id": bool(raw_work.get("preserve_work_id") or raw_work.get("cloud_preserve_work_id")),
+                    }
+                )
+                prepared_slots.append({"raw_work": raw_work, "write_index": len(write_candidates) - 1})
+        hydrated_by_id = {
+            str(item.get("work_id") or ""): item
+            for item in self.store.get_items_by_ids("source_works", self._ordered_unique(hydrated_ids))
+        }
+        written = self._v2_upsert_work_metadata_batch(write_candidates, model_mode=model_mode)
+        prepared: list[dict[str, Any]] = []
+        for slot in prepared_slots:
+            raw_work = dict(slot.get("raw_work") or {})
+            work = slot.get("ready_work")
+            if not work and slot.get("hydrated_work_id"):
+                work = hydrated_by_id.get(str(slot.get("hydrated_work_id") or ""))
+            if not work and "write_index" in slot:
+                work = written[int(slot["write_index"])]
+            if not work:
+                continue
+            prepared.append({**raw_work, **dict(work), "work_id": str(work.get("work_id") or "")})
+        return prepared
+
+    def _v2_upsert_work_metadata_batch(self, candidates: list[dict[str, Any]], *, model_mode: str) -> list[dict[str, Any]]:
+        if not candidates:
+            return []
+        id_key = "work_id"
+        model = self._v2_model_meta(model_mode)
+        initial_ids = self._ordered_unique(
+            [
+                str(candidate.get("existing_id") or stable_id("W", candidate.get("canonical_key") or ""))
+                for candidate in candidates
+            ]
+        )
+        existing_by_id = {
+            str(item.get(id_key) or ""): item
+            for item in self.store.get_items_by_ids("source_works", initial_ids)
+        }
+        keys_for_lookup = self._ordered_unique(
+            [
+                str(candidate.get("canonical_key") or "")
+                for candidate in candidates
+                if str(candidate.get("canonical_key") or "")
+                and not (str(candidate.get("existing_id") or "") and bool(candidate.get("preserve_existing_id")))
+            ]
+        )
+        existing_by_key: dict[str, dict[str, Any]] = {}
+        if keys_for_lookup:
+            with self.store._lock, self.store._connect() as conn:
+                for index in range(0, len(keys_for_lookup), 300):
+                    chunk = keys_for_lookup[index : index + 300]
+                    placeholders = ",".join("?" for _ in chunk)
+                    rows = conn.execute(
+                        f"""
+                        SELECT payload FROM records
+                        WHERE bucket = 'source_works'
+                        AND json_extract(payload, '$.canonical_key') IN ({placeholders})
+                        """,
+                        chunk,
+                    ).fetchall()
+                    for row in rows:
+                        item = json.loads(row["payload"])
+                        key = str(item.get("canonical_key") or "")
+                        if key and key not in existing_by_key:
+                            existing_by_key[key] = item
+        output: list[dict[str, Any]] = []
+        rows_to_write: list[dict[str, Any]] = []
+        for candidate in candidates:
+            canonical_key = str(candidate.get("canonical_key") or "")
+            existing_id = str(candidate.get("existing_id") or "")
+            record_id = existing_id or stable_id("W", canonical_key)
+            item = existing_by_id.get(record_id) or {}
+            if not item and not (existing_id and bool(candidate.get("preserve_existing_id"))):
+                by_key = existing_by_key.get(canonical_key)
+                if by_key:
+                    item = by_key
+                    record_id = str(by_key.get(id_key) or record_id)
+            payload = dict(candidate.get("payload") or {})
+            variant_id = stable_id("VER", record_id, model["provider"], model["model_name"])
+            variants = dict(item.get("variants") or {})
+            prior_payload = dict((variants.get(variant_id) or {}).get("payload") or {})
+            merged_payload = self._v2_merge_payloads(prior_payload, payload)
+            variants[variant_id] = {
+                "version_id": variant_id,
+                "model_mode": model["model_mode"],
+                "model_name": model["model_name"],
+                "provider": model["provider"],
+                "entered_at": (variants.get(variant_id) or {}).get("entered_at") or utc_now(),
+                "extracted_at": utc_now(),
+                "payload": merged_payload,
+                "source_urls": self._ordered_unique([*(payload.get("source_urls") or []), payload.get("paper_link", "")]),
+                "confidence_score": float(payload.get("confidence_score", 0.62) or 0.62),
+                "needs_review": bool(payload.get("needs_review", False)),
+                "is_user_edit": False,
+            }
+            active_id = item.get("active_version_id") or variant_id
+            active_variant = variants.get(active_id) or {}
+            if not active_variant.get("is_user_edit"):
+                active_id = variant_id
+            active_payload = dict(variants.get(active_id, {}).get("payload") or merged_payload)
+            base = {
+                **item,
+                **active_payload,
+                id_key: record_id,
+                "canonical_id": item.get("canonical_id") or record_id,
+                "canonical_key": canonical_key,
+                "active_version_id": active_id,
+                "variants": variants,
+                "model_mode": variants[active_id]["model_mode"],
+                "model_name": variants[active_id]["model_name"],
+                "provider": variants[active_id]["provider"],
+                "entered_at": variants[active_id]["entered_at"],
+                "extracted_at": variants[active_id]["extracted_at"],
+                "confidence_score": variants[active_id]["confidence_score"],
+                "created_at": item.get("created_at") or utc_now(),
+                "updated_at": utc_now(),
+            }
+            rows_to_write.append(base)
+            output.append(base)
+            existing_by_id[record_id] = base
+            if canonical_key and not (existing_id and bool(candidate.get("preserve_existing_id"))):
+                existing_by_key[canonical_key] = base
+        if rows_to_write:
+            self.store.upsert_many("source_works", rows_to_write, id_key)
+        return output
+
+    def _v2_needs_llm_extraction(self, work: dict[str, Any], model_mode: str, *, known_has_model_coverage: bool | None = None) -> bool:
         title = compact_text(work.get("title") or "Untitled work", 240)
         canonical_key = self._v2_canonical_key(title)
         existing = self._v2_find_by_key("source_works", canonical_key)
         if not existing:
             return True
+        existing_work_id = str(existing.get("work_id") or "")
+        has_model_coverage = (
+            bool(known_has_model_coverage)
+            if known_has_model_coverage is not None
+            else self._v2_has_model_extraction_coverage(existing_work_id, model_mode)
+        )
+        if (
+            existing_work_id
+            and has_model_coverage
+            and not self._work_needs_refresh(work, existing)
+        ):
+            return False
         variants = list((existing.get("variants") or {}).values())
         exact = [variant for variant in variants if variant.get("model_mode") == model_mode and not variant.get("is_user_edit")]
         if not exact:
@@ -4054,6 +5925,71 @@ class PrincipiaEngine:
         if new_modified and old_modified != new_modified:
             return True
         return False
+
+    def _v2_has_model_extraction_coverage(self, work_id: str, model_mode: str) -> bool:
+        counts = self.v2_work_extraction_counts(work_id, model_mode=model_mode)
+        return bool(
+            int(counts.get("existed_ideas") or 0) > 0
+            or int(counts.get("principles") or 0) > 0
+            or int(counts.get("takeaway_messages") or 0) > 0
+            or int(counts.get("benchmark_records") or 0) > 0
+            or int(counts.get("baseline_records") or 0) > 0
+        )
+
+    def _v2_work_has_model_core_extraction(self, work_id: str, model_mode: str) -> bool:
+        counts = self.v2_work_extraction_counts(work_id, model_mode=model_mode)
+        return any(int(counts.get(bucket) or 0) > 0 for bucket in ("existed_ideas", "principles", "takeaway_messages"))
+
+    def _v2_work_needs_research(self, work: dict[str, Any], model_mode: str, *, count_map: dict[str, dict[str, int]] | None = None) -> bool:
+        work_id = str(work.get("work_id") or "")
+        if not work_id:
+            title = compact_text(work.get("title") or "Untitled work", 240)
+            existing = self._v2_find_by_key("source_works", self._v2_canonical_key(title))
+            work_id = str(existing.get("work_id") or "") if existing else ""
+        if not work_id:
+            return True
+        counts = (count_map or {}).get(work_id)
+        has_core_extraction = (
+            any(int(counts.get(bucket) or 0) > 0 for bucket in ("existed_ideas", "principles", "takeaway_messages"))
+            if counts is not None
+            else self._v2_work_has_model_core_extraction(work_id, model_mode)
+        )
+        if not has_core_extraction:
+            return True
+        return self._v2_needs_llm_extraction(work, model_mode, known_has_model_coverage=True)
+
+    def _v2_add_existing_extractions_to_project(
+        self,
+        field_id: str,
+        work_id: str,
+        *,
+        model_mode: str,
+        source: str = "cloud_reuse",
+    ) -> dict[str, list[str]]:
+        linked: dict[str, list[str]] = {
+            "existed_ideas": [],
+            "principles": [],
+            "takeaway_messages": [],
+            "benchmark_records": [],
+            "baseline_records": [],
+            "result_records": [],
+        }
+        if not field_id or field_id == "default" or not work_id:
+            return linked
+        target_model = self._v2_model_meta(model_mode) if str(model_mode or "") != "auto" else {}
+        for link in self._v2_evidence_links_for_equivalent_work(work_id):
+            bucket = str(link.get("target_bucket") or "")
+            target_id = str(link.get("target_id") or "")
+            if bucket not in linked or not target_id:
+                continue
+            item = self.store.get_item(bucket, target_id)
+            if target_model and (not item or not self._v2_record_has_model_variant(item, target_model)):
+                continue
+            linked[bucket].append(target_id)
+        for bucket, ids in linked.items():
+            if ids:
+                self.add_project_memberships(field_id, bucket, self._ordered_unique(ids), source=source, prepend=bucket == "existed_ideas")
+        return {bucket: self._ordered_unique(ids) for bucket, ids in linked.items()}
 
     def _rank_works_for_query(self, goal_text: str, works: list[dict[str, Any]]) -> list[dict[str, Any]]:
         ranked = list(works)
@@ -4151,6 +6087,15 @@ class PrincipiaEngine:
 
     def _v2_searchable_text(self, item: dict[str, Any]) -> str:
         payload = item
+        active_payload = {}
+        active_variant = item.get("active_variant") if isinstance(item, dict) else {}
+        if isinstance(active_variant, dict) and isinstance(active_variant.get("payload"), dict):
+            active_payload = active_variant.get("payload") or {}
+        elif isinstance(item.get("variants"), dict):
+            active_id = str(item.get("active_version_id") or "")
+            active_variant = item.get("variants", {}).get(active_id) if active_id else {}
+            if isinstance(active_variant, dict) and isinstance(active_variant.get("payload"), dict):
+                active_payload = active_variant.get("payload") or {}
         values: list[str] = []
         for key in (
             "title",
@@ -4161,6 +6106,16 @@ class PrincipiaEngine:
             "abstract",
             "summary",
             "description",
+            "venue",
+            "venue_or_source",
+            "publication",
+            "publication_date",
+            "publisher",
+            "year",
+            "source_type",
+            "source",
+            "url_or_doi",
+            "paper_link",
             "core_idea",
             "argument",
             "main_results",
@@ -4176,28 +6131,112 @@ class PrincipiaEngine:
             "actionable_lesson",
             "one_sentence_thesis",
             "novelty_claim",
-            "venue_or_source",
             "source_work_title",
             "source_paper_title",
+            "source_paper_link",
+            "authors_text",
+            "author_text",
+            "affiliations_text",
+            "affiliation_text",
+            "keywords_text",
         ):
-            value = payload.get(key) if isinstance(payload, dict) else item.get(key)
-            if value:
-                values.append(str(value))
+            for source in (payload, active_payload):
+                value = source.get(key) if isinstance(source, dict) else None
+                if value:
+                    values.append(str(value))
         for key in (
             "metrics",
             "benchmarks",
             "source_work_ids",
             "source_works",
             "domain_tags",
+            "authors",
+            "author_names",
+            "affiliations",
+            "institutions",
+            "keywords",
+            "topics",
+            "source_urls",
             "mechanistic_design",
             "why_it_might_work",
             "validation_protocol",
             "relevant_baselines",
         ):
-            value = payload.get(key) if isinstance(payload, dict) else item.get(key)
-            if isinstance(value, list):
-                values.extend(str(entry) for entry in value[:24] if entry)
+            for source in (payload, active_payload):
+                value = source.get(key) if isinstance(source, dict) else None
+                values.extend(self._v2_searchable_value_parts(value, limit=48))
+        values.extend(self._v2_linked_source_work_search_parts(item))
         return " ".join(values)
+
+    def _v2_searchable_value_parts(self, value: Any, *, limit: int = 48, depth: int = 0) -> list[str]:
+        if value is None or value == "" or depth > 2:
+            return []
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, (int, float)):
+            return [str(value)]
+        parts: list[str] = []
+        if isinstance(value, dict):
+            for key, item in list(value.items())[:limit]:
+                if key:
+                    parts.append(str(key))
+                parts.extend(self._v2_searchable_value_parts(item, limit=limit, depth=depth + 1))
+                if len(parts) >= limit:
+                    break
+            return parts[:limit]
+        if isinstance(value, (list, tuple, set)):
+            for item in list(value)[:limit]:
+                parts.extend(self._v2_searchable_value_parts(item, limit=limit, depth=depth + 1))
+                if len(parts) >= limit:
+                    break
+            return parts[:limit]
+        return [str(value)]
+
+    def _v2_linked_source_work_search_parts(self, item: dict[str, Any]) -> list[str]:
+        if not isinstance(item, dict) or item.get("work_id"):
+            return []
+        source_ids: list[str] = []
+        inline_works: list[dict[str, Any]] = []
+        for key in ("source_work_ids", "source_works", "work_ids", "work_id"):
+            raw = item.get(key)
+            values = raw if isinstance(raw, list) else [raw]
+            for value in values:
+                if isinstance(value, dict):
+                    inline_works.append(value)
+                elif value:
+                    source_ids.append(str(value))
+        works = list(inline_works)
+        for work_id in self._ordered_unique(source_ids)[:12]:
+            work = self.store.get_item("source_works", work_id)
+            if isinstance(work, dict):
+                works.append(work)
+        parts: list[str] = []
+        for work in works[:12]:
+            for key in (
+                "title",
+                "abstract",
+                "summary",
+                "venue",
+                "venue_or_source",
+                "publication",
+                "publication_date",
+                "publisher",
+                "year",
+                "authors",
+                "author_names",
+                "authors_text",
+                "author_text",
+                "affiliations",
+                "institutions",
+                "affiliations_text",
+                "affiliation_text",
+                "keywords",
+                "topics",
+                "url_or_doi",
+                "paper_link",
+            ):
+                parts.extend(self._v2_searchable_value_parts(work.get(key), limit=24))
+        return parts[:240]
 
     def _venue_quality_rank(self, venue: str) -> int:
         value = str(venue or "").lower()
@@ -4242,6 +6281,7 @@ class PrincipiaEngine:
         model_mode: str,
         is_user_edit: bool = False,
         existing_id: str = "",
+        preserve_existing_id: bool = False,
     ) -> dict[str, Any]:
         bucket = self._v2_bucket(bucket)
         id_key = self._record_id_key(bucket)
@@ -4288,7 +6328,7 @@ class PrincipiaEngine:
         canonical_key = self._v2_canonical_key(key_text)
         record_id = existing_id or stable_id(prefix, canonical_key)
         item = self.store.get_item(bucket, record_id) or {}
-        if not item and bucket in {"source_works", "existed_ideas", "principles", "takeaway_messages", "benchmark_records", "baseline_records"}:
+        if not item and not (existing_id and preserve_existing_id) and bucket in {"source_works", "existed_ideas", "principles", "takeaway_messages", "benchmark_records", "baseline_records"}:
             by_key = self._v2_find_by_key(bucket, canonical_key)
             if by_key:
                 item = by_key
@@ -4379,16 +6419,13 @@ class PrincipiaEngine:
         return limited
 
     def _v2_extract_concepts_from_work(self, goal_text: str, work: dict[str, Any], llm_extra: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
-        text = " ".join([work.get("title", ""), work.get("abstract", ""), work.get("transient_full_text", ""), " ".join(work.get("work_principles", [])), " ".join(work.get("work_insights", [])), " ".join(work.get("work_novelty", []))])
+        text = self._normalize_pdf_text(" ".join([work.get("title", ""), work.get("abstract", ""), work.get("transient_full_text", ""), " ".join(work.get("work_principles", [])), " ".join(work.get("work_insights", [])), " ".join(work.get("work_novelty", []))]))
         source = self._v2_source_payload(work)
-        if llm_extra:
-            novelty_raw = llm_extra.get("existed_ideas", []) or self._extract_novelty_points(text) or work.get("work_novelty", [])
-            principle_raw = llm_extra.get("principles", []) or work.get("work_principles", []) or self._extract_principle_sentences(text)
-            message_raw = llm_extra.get("takeaway_messages", []) or self._extract_insight_messages(text) or work.get("work_insights", [])
-        else:
-            novelty_raw = self._extract_novelty_points(text) or work.get("work_novelty", [])
-            principle_raw = work.get("work_principles", []) or self._extract_principle_sentences(text)
-            message_raw = self._extract_insight_messages(text) or work.get("work_insights", [])
+        if not llm_extra:
+            return {"existed_ideas": [], "principles": [], "takeaway_messages": []}
+        novelty_raw = llm_extra.get("existed_ideas", []) or []
+        principle_raw = llm_extra.get("principles", []) or []
+        message_raw = llm_extra.get("takeaway_messages", []) or []
         novelty = self._v2_normalize_concepts(novelty_raw, kind="idea", work=work, text=text, goal_text=goal_text, allow_fallback=False, source_sentence_mode=True)
         principles = self._v2_normalize_concepts(principle_raw, kind="principle", work=work, text=text, goal_text=goal_text, allow_fallback=False, source_sentence_mode=True)
         messages = self._v2_normalize_concepts(message_raw, kind="message", work=work, text=text, goal_text=goal_text, allow_fallback=False, source_sentence_mode=True)
@@ -4396,7 +6433,7 @@ class PrincipiaEngine:
         principles = [item for item in principles if self._v2_argument_key(item["text"]) not in novelty_keys]
         principle_keys = {self._v2_argument_key(item["text"]) for item in principles}
         messages = [item for item in messages if self._v2_argument_key(item["text"]) not in novelty_keys and self._v2_argument_key(item["text"]) not in principle_keys]
-        method = "llm_extracted" if llm_extra else "source_sentence_extraction"
+        method = "llm_extracted"
         return {
             "existed_ideas": [
                 {
@@ -5492,10 +7529,13 @@ class PrincipiaEngine:
                     "Use the user's own note as first-priority evidence, then use selected existed ideas/principles/messages. "
                     "Return keys: title, novelty_claim, mechanistic_design(list), method_variants(list), why_it_might_work(list), validation_protocol(list), "
                     "relevant_baselines(list), metrics(list), risks(list), derived_principles(list), one_sentence_thesis. "
-                    "mechanistic_design must be implementation-level, not slogan-level: include variables/data structures, the algorithmic loop, a scoring or update rule with paper-ready LaTeX formulas when useful, and how the method consumes evidence. Use $...$ or $$...$$ for every formula and define every variable in plain English. "
+                    "novelty_claim must be 1-2 sharp sentences about the integrated methodological novelty for the problem area. Do not start with or rely on template comparisons such as 'Unlike ...', 'Compared with ...', 'Rather than ...', or novelty relative to one selected paper. Lead with the new control surface, representation, objective, or inference protocol and why it changes what becomes measurable or steerable in the area. "
+                    "mechanistic_design must be implementation-level, not slogan-level, and should read like a concise methodology section: include variables/data structures, the algorithmic loop, a scoring or update rule with paper-ready LaTeX formulas when useful, and how the method consumes evidence. Use $...$ or $$...$$ for every formula and define every variable in plain English. Do not describe derivation graph nodes, do not start items with 'this node', and do not use lineage-node summaries as the method. "
                     "method_variants must contain 2-4 concrete alternatives or ablations that could be tried if the main design fails, each with the changed mechanism and expected tradeoff. "
                     "derived_principles and relevant_baselines must include both a short symbol/name and the full argument or method, for example 'P.XYZ: full reusable argument...' rather than a bare symbol. "
-                    "Be more ambitious than an incremental combination of selected evidence: identify a new mechanism, representation, optimization objective, or inference-time control loop that the prior works do not already contain. "
+                    "Treat selected evidence as inspiration and constraints, not text to copy. Do not reuse an evidence title, method name, metric, composite score, or mechanism as the generated idea unless you are explicitly citing it as prior evidence. "
+                    "Be more ambitious than an incremental combination of selected evidence: identify a new mechanism, representation, optimization objective, or inference-time control loop that the prior works do not already contain, and state what makes it different from the closest selected evidence. "
+                    "Before returning, run a novelty and feasibility check: remove any sentence that is merely a paraphrase of selected evidence, remove any invented algebraic symbol whose variable is not defined, and replace decorative formulas with precise algorithmic prose. "
                     "Do not invent benchmark names, performance numbers, percentages, ranges, or paper claims absent from selected evidence. If a number is not explicitly present in selected evidence, describe it as a validation target without a numeric value.\n\n"
                     f"Project: {profile.get('name')}\nGoal: {goal_text}\nUser note: {user_note}\nSelected evidence: {json.dumps(context, ensure_ascii=False)}{prior_context}"
                 ),
@@ -5645,7 +7685,15 @@ class PrincipiaEngine:
             "created_at": base.get("created_at") or payload.get("created_at") or utc_now(),
         }
 
-    def _v2_present_item(self, item: dict[str, Any], *, model_mode: str = "auto", version_id: str = "", compact: bool = False) -> dict[str, Any]:
+    def _v2_present_item(
+        self,
+        item: dict[str, Any],
+        *,
+        model_mode: str = "auto",
+        version_id: str = "",
+        compact: bool = False,
+        include_work_counts: bool = True,
+    ) -> dict[str, Any]:
         active = self._v2_active_variant(item, model_mode=model_mode, version_id=version_id)
         if compact:
             payload = {key: value for key, value in item.items() if key != "variants"}
@@ -5670,8 +7718,8 @@ class PrincipiaEngine:
             payload = self._v2_repair_my_idea_payload(payload)
         if (item.get("canonical_id") or payload.get("message_text")) and (payload.get("message_text") or payload.get("actionable_lesson")):
             payload = self._v2_repair_takeaway_payload(payload)
-        if item.get("work_id"):
-            counts = self.v2_work_extraction_counts(str(item.get("work_id") or ""))
+        if include_work_counts and item.get("work_id"):
+            counts = self.v2_work_extraction_counts(str(item.get("work_id") or ""), model_mode=model_mode)
             payload["work_extraction_counts"] = counts
             payload["work_extracted"] = counts.get("total", 0) > 0
         versions = [
@@ -5967,20 +8015,466 @@ class PrincipiaEngine:
 
     def _v2_repair_my_idea_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         repaired = dict(payload)
-        if repaired.get("generation_mode") == "principia_calculus" or repaired.get("derivation_id"):
+        repaired = self._v2_normalize_my_idea_math_payload(repaired)
+        generation_mode = str(repaired.get("generation_mode") or "").strip().lower()
+        if generation_mode == "principia_calculus" or (not generation_mode and repaired.get("derivation_id")):
             repaired = self._v1_repair_symbolic_legacy_payload(repaired)
+            repaired = self._v2_normalize_my_idea_math_payload(repaired)
         title = str(repaired.get("title") or "").strip()
         thesis = str(repaired.get("one_sentence_thesis") or "").strip()
         if not title or "..." in title or (thesis and title.lower() == thesis.lower()):
             repaired["title"] = self._v2_title_from_idea(repaired)
         if not thesis or thesis.lower() == str(repaired.get("title", "")).lower():
-            mechanisms = self._listify(repaired.get("mechanistic_design"))
+            mechanisms = self._v2_listify_idea_text(repaired.get("mechanistic_design"))
             first = mechanisms[0] if mechanisms else repaired.get("novelty_claim", "")
             repaired["one_sentence_thesis"] = compact_text(
                 first or "A project-specific idea that links selected evidence to a falsifiable validation path.",
                 520,
             )
+        mechanisms = [self._v2_normalize_latex_fragments(item) for item in self._v2_listify_idea_text(repaired.get("mechanistic_design"))]
+        if self._v2_mechanistic_design_needs_repair(mechanisms):
+            repaired["mechanistic_design"] = self._v2_methodology_mechanistic_design(repaired)
+            mechanisms = self._v2_listify_idea_text(repaired.get("mechanistic_design"))
+        else:
+            repaired["mechanistic_design"] = mechanisms
+        if self._v2_novelty_claim_needs_repair(str(repaired.get("novelty_claim") or "")):
+            repaired["novelty_claim"] = self._v2_methodological_novelty_claim(repaired, mechanisms)
+        return self._v2_normalize_my_idea_math_payload(repaired)
+
+    def _v2_novelty_claim_needs_repair(self, claim: str) -> bool:
+        value = compact_text(str(claim or ""), 900).strip()
+        if not value:
+            return True
+        lower = value.lower()
+        if self._v2_text_contains_structured_artifact(value):
+            return True
+        if re.search(r"\bpropose\s+s\b|\bproposes\s+s\b", lower):
+            return True
+        if self._v2_has_unrendered_symbolic_math(value):
+            return True
+        template_openers = (
+            "unlike ",
+            "compared with ",
+            "compared to ",
+            "rather than ",
+            "instead of ",
+            "in contrast to ",
+            "where prior ",
+            "while prior ",
+        )
+        if lower.startswith(template_openers):
+            return True
+        if re.match(r"^(unlike|compared with|compared to|rather than|instead of)\b", lower):
+            return True
+        if lower.count(" unlike ") + lower.count(" compared with ") + lower.count(" compared to ") >= 2:
+            return True
+        words = re.findall(r"[A-Za-z0-9]+", value)
+        if len(words) < 10:
+            return True
+        return False
+
+    def _v2_methodological_novelty_claim(self, idea: dict[str, Any], mechanisms: list[Any] | None = None) -> str:
+        title = compact_text(str(idea.get("title") or "This idea"), 90).rstrip(".")
+        thesis = compact_text(str(idea.get("one_sentence_thesis") or ""), 240).rstrip(".")
+        mechanism = ""
+        for item in mechanisms or self._listify(idea.get("mechanistic_design")):
+            text = self._v2_novelty_mechanism_phrase(self._strip_method_label(str(item or "")))
+            if len(re.findall(r"[A-Za-z0-9]+", text)) >= 10:
+                mechanism = compact_text(text, 210).rstrip(".")
+                break
+        source = " ".join([title, thesis, mechanism, str(idea.get("user_note") or "")])
+        pressure = self._v2_novelty_problem_phrase(source)
+        control = self._v2_novelty_control_phrase(source)
+        if mechanism:
+            return (
+                f"{title} reframes {pressure} as an active control problem: {mechanism}. "
+                f"Its methodological novelty is that control variables such as {control} become explicit, measurable intervention variables before failures surface as final-output errors."
+            )
+        if thesis:
+            return (
+                f"{title} reframes {pressure} through a new methodological contract: {thesis}. "
+                f"Its novelty is to make {control} explicit and testable, so the contribution is a controllable research protocol rather than a post-hoc comparison."
+            )
+        return (
+            f"{title} reframes {pressure} as a controllable research protocol. "
+            f"Its novelty is to make {control} explicit intervention variables that can be measured, ablated, and improved directly."
+        )
+
+    def _strip_method_label(self, text: str) -> str:
+        value = compact_text(str(text or ""), 800).strip()
+        value = re.sub(r"^\s*(data structures|algorithm|scoring rule|control loop|validation hook|mechanism|method|step)\s*[:.-]\s*", "", value, flags=re.I)
+        return value
+
+    def _v2_novelty_mechanism_phrase(self, text: str) -> str:
+        value = str(text or "")
+        value = re.sub(r"\$?Role_\{gen\}\$?", "the generator role", value)
+        value = re.sub(r"\$?Role_\{crit\}\$?", "the critic role", value)
+        value = re.sub(r"(\$\$[\s\S]+?\$\$|\$[^$\n]{1,700}\$|\\\[[\s\S]+?\\\]|\\\([^()\n]{1,700}\\\))", "", value)
+        value = re.sub(r"\b[A-Za-z][A-Za-z0-9]*_\{[^{}]+\}", "", value)
+        value = re.sub(r"\s+,", ",", value)
+        value = re.sub(r"\s+", " ", value).strip(" .;:,")
+        sentences = sentence_split(value)
+        if sentences:
+            selected: list[str] = []
+            for sentence in sentences:
+                candidate = " ".join([*selected, sentence]).strip()
+                if selected and len(candidate) > 190:
+                    break
+                selected.append(sentence)
+                if len(candidate) >= 120:
+                    break
+            value = " ".join(selected).strip() or value
+        if len(value) > 210:
+            cut = value[:210]
+            boundary = max(cut.rfind(". "), cut.rfind("; "), cut.rfind(", "), cut.rfind(" "))
+            value = cut[:boundary].strip() if boundary > 80 else cut.strip()
+        return value.rstrip(" .;:,")
+
+    def _v2_novelty_problem_phrase(self, text: str) -> str:
+        lower = str(text or "").lower()
+        if any(term in lower for term in ("autonomous code", "code repositor", "coding agent", "software agent", "defect")):
+            return "autonomous-code quality control"
+        if "clip" in lower or "vision-language" in lower or "few-shot" in lower:
+            return "few-shot vision-language adaptation"
+        if "multi-agent" in lower or "agentic" in lower or "mas" in lower:
+            return "multi-agent scientific reasoning"
+        if "logical" in lower or "logic" in lower or "symbolic" in lower:
+            return "symbolic and logical reasoning with LLMs"
+        if "test-time" in lower or "inference-time" in lower:
+            return "inference-time model adaptation"
+        terms = keyword_terms(text, 5)
+        return " ".join(terms[:4]) if terms else "the target research problem"
+
+    def _v2_novelty_control_phrase(self, text: str) -> str:
+        lower = str(text or "").lower()
+        controls: list[str] = []
+        for trigger, phrase in (
+            ("uncertain", "uncertainty"),
+            ("entropy", "entropy"),
+            ("budget", "verification budget"),
+            ("escalat", "escalation"),
+            ("route", "routing state"),
+            ("adapter", "adaptation state"),
+            ("benchmark", "benchmark-conditioned evidence"),
+            ("memory", "retrieval memory"),
+            ("constraint", "constraints"),
+            ("feedback", "feedback signals"),
+        ):
+            if trigger in lower and phrase not in controls:
+                controls.append(phrase)
+        if not controls:
+            controls = ["state", "evidence", "constraints"]
+        return ", ".join(controls[:3])
+
+    def _v2_normalize_my_idea_math_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        repaired = dict(payload)
+        math_sensitive_fields = (
+            "one_sentence_thesis",
+            "novelty_claim",
+            "mechanistic_design",
+            "method_variants",
+            "why_it_might_work",
+            "validation_protocol",
+            "relevant_baselines",
+            "baselines",
+            "metrics",
+            "risks",
+            "failure_modes",
+            "derived_principles",
+            "reasoning_trace",
+            "branching_summary",
+            "self_feedback",
+        )
+        for key in math_sensitive_fields:
+            if key in repaired:
+                repaired[key] = self._v2_normalize_math_value(repaired[key])
         return repaired
+
+    def _v2_normalize_math_value(self, value: Any) -> Any:
+        if isinstance(value, str):
+            return self._v2_normalize_latex_fragments(value)
+        if isinstance(value, list):
+            return [self._v2_normalize_math_value(item) for item in value]
+        if isinstance(value, dict):
+            return {key: self._v2_normalize_math_value(item) for key, item in value.items()}
+        return value
+
+    def _v2_listify_idea_text(self, value: Any, *, max_chars: int = 1600) -> list[str]:
+        if isinstance(value, list):
+            output: list[str] = []
+            for item in value:
+                output.extend(self._v2_listify_idea_text(item, max_chars=max_chars))
+            return output
+        if isinstance(value, dict):
+            text = self._v2_plain_structured_item(value)
+            return [compact_text(text, max_chars)] if text else []
+        if isinstance(value, str) and value.strip():
+            parsed = self._v2_parse_structured_text(value)
+            if parsed is not None:
+                return self._v2_listify_idea_text(parsed, max_chars=max_chars)
+            return [compact_text(value, max_chars)]
+        if value is None:
+            return []
+        text = compact_text(str(value), max_chars).strip()
+        return [text] if text else []
+
+    def _v2_normalize_latex_fragments(self, text: str) -> str:
+        pattern = re.compile(r"(\$\$[\s\S]+?\$\$|\$[^$\n]{1,700}\$|\\\[[\s\S]+?\\\]|\\\([^()\n]{1,700}\\\))")
+
+        def replace(match: re.Match[str]) -> str:
+            raw = match.group(0)
+            if raw.startswith("$$"):
+                return "$$" + self._v2_normalize_latex_formula(raw[2:-2]) + "$$"
+            if raw.startswith("$"):
+                return "$" + self._v2_normalize_latex_formula(raw[1:-1]) + "$"
+            if raw.startswith("\\["):
+                return "\\[" + self._v2_normalize_latex_formula(raw[2:-2]) + "\\]"
+            return "\\(" + self._v2_normalize_latex_formula(raw[2:-2]) + "\\)"
+
+        value = str(text or "")
+        parts: list[str] = []
+        cursor = 0
+        for match in pattern.finditer(value):
+            if match.start() > cursor:
+                parts.append(self._v2_wrap_bare_latex_fragments(value[cursor : match.start()]))
+            parts.append(replace(match))
+            cursor = match.end()
+        if cursor < len(value):
+            parts.append(self._v2_wrap_bare_latex_fragments(value[cursor:]))
+        normalized = "".join(parts)
+        if normalized.count("$") % 2 == 1:
+            last_dollar = normalized.rfind("$")
+            if last_dollar >= 0:
+                normalized = normalized[:last_dollar] + normalized[last_dollar + 1 :]
+        return normalized
+
+    def _v2_wrap_bare_latex_fragments(self, text: str) -> str:
+        value = str(text or "")
+        if "\\" not in value and not re.search(r"\b[A-Z][A-Za-z0-9]*_\{[^{}]+\}", value):
+            return value
+        start_pattern = re.compile(
+            r"(?<![$\\])\\(?:"
+            r"mathcal|mathbb|mathbf|mathrm|mathit|operatorname|text|frac|sqrt|sum|prod|int|"
+            r"alpha|beta|gamma|delta|epsilon|varepsilon|lambda|mu|nu|pi|rho|sigma|tau|theta|Theta|Phi|phi|"
+            r"cdot|times|leq|geq|neq|approx|infty|ldots|dots"
+            r")\b|(?<![$\\])\b[A-Z][A-Za-z0-9]*_\{[^{}]+\}"
+        )
+        output: list[str] = []
+        cursor = 0
+        for match in start_pattern.finditer(value):
+            start = match.start()
+            if start < cursor:
+                continue
+            end = self._v2_bare_latex_fragment_end(value, start)
+            raw = value[start:end]
+            if not self._v2_is_bare_latex_fragment(raw):
+                continue
+            output.append(value[cursor:start])
+            formula = raw.strip()
+            trailing = ""
+            while formula and formula[-1] in ",.;:" and not formula.endswith("..."):
+                trailing = formula[-1] + trailing
+                formula = formula[:-1].rstrip()
+            output.append("$" + self._v2_normalize_latex_formula(formula) + "$" + trailing)
+            cursor = end
+        if cursor == 0:
+            return value
+        output.append(value[cursor:])
+        return "".join(output)
+
+    def _v2_bare_latex_fragment_end(self, text: str, start: int) -> int:
+        stop_words = {
+            "and",
+            "or",
+            "where",
+            "when",
+            "with",
+            "without",
+            "via",
+            "using",
+            "from",
+            "for",
+            "by",
+            "to",
+            "as",
+            "is",
+            "are",
+            "be",
+            "the",
+            "a",
+            "an",
+            "of",
+            "in",
+            "on",
+            "under",
+            "over",
+            "across",
+            "against",
+            "before",
+            "after",
+            "then",
+            "so",
+            "which",
+            "that",
+            "because",
+            "while",
+            "plus",
+        }
+        end = start
+        brace_depth = 0
+        allowed = set("\\{}_^()+-*/=<>.,:[]| ")
+        while end < len(text):
+            char = text[end]
+            if brace_depth <= 0:
+                if char in "\n;":
+                    break
+                if char == "." and not text.startswith("...", end) and end + 1 < len(text) and text[end + 1].isspace():
+                    break
+                if char.isspace():
+                    word_match = re.match(r"\s+([A-Za-z][A-Za-z-]*)\b", text[end:])
+                    if word_match and word_match.group(1).lower() in stop_words:
+                        break
+            if char == "{":
+                brace_depth += 1
+            elif char == "}":
+                brace_depth = max(0, brace_depth - 1)
+            if char.isalnum() or char in allowed:
+                end += 1
+                continue
+            break
+        return max(end, start + 1)
+
+    def _v2_is_bare_latex_fragment(self, text: str) -> bool:
+        value = str(text or "").strip()
+        if len(value) < 2 or "$" in value:
+            return False
+        command_pattern = (
+            r"\\(?:mathcal|mathbb|mathbf|mathrm|mathit|operatorname|text|frac|sqrt|sum|prod|int|"
+            r"alpha|beta|gamma|delta|epsilon|varepsilon|lambda|mu|nu|pi|rho|sigma|tau|theta|Theta|Phi|phi|"
+            r"cdot|times|leq|geq|neq|approx|infty|ldots|dots)\b"
+        )
+        has_command = re.search(command_pattern, value)
+        has_symbol_subscript = re.search(r"\b[A-Z][A-Za-z0-9]*_\{[^{}]+\}", value)
+        if not has_command and not has_symbol_subscript:
+            return False
+        words = re.findall(r"\b[A-Za-z]{3,}\b", re.sub(r"\\[A-Za-z]+|[A-Za-z]_\{[^{}]+\}", " ", value))
+        prose_words = [word for word in words if word.lower() not in {"sin", "cos", "log", "min", "max"}]
+        return len(prose_words) <= 2
+
+    def _v2_normalize_latex_formula(self, formula: str) -> str:
+        value = str(formula or "")
+        value = re.sub(r"\\?\x08ar", r"\\bar", value)
+        value = re.sub(r"\\?\x08ullet", r"\\bullet", value)
+        value = re.sub(r"\\?\x08eta", r"\\beta", value)
+        value = value.replace("\\\\", "\\").strip()
+        value = value.replace("...", r"\ldots")
+        value = re.sub(r"(?<!\\)\bext\{", r"\\text{", value)
+        value = re.sub(r"(?<!\\)\brac\{", r"\\frac{", value)
+        value = re.sub(r"(?<!\\)\bmathbb\{", r"\\mathbb{", value)
+        value = re.sub(r"(?<!\\)\beal(_\{[^{}]+\})?", lambda match: r"\mathbb{R}" + (match.group(1) or ""), value)
+        dropped_commands = {
+            "ullet": "bullet",
+            "ar": "bar",
+            "heta": "theta",
+            "abla": "nabla",
+            "au": "tau",
+            "ho": "rho",
+        }
+        value = re.sub(
+            r"(?<!\\)\b(ullet|ar|heta|abla|au|ho)(?=\b|[_^]|[{])",
+            lambda match: "\\" + dropped_commands[match.group(1)],
+            value,
+        )
+        value = re.sub(r"\\ullet\b", r"\\bullet", value)
+        value = re.sub(r"\\ar\{([^{}]+)\}", r"\\bar{\1}", value)
+        value = re.sub(r"\\ar([A-Za-z])\b", r"\\bar{\1}", value)
+        value = re.sub(r"\\\s+(\\[A-Za-z])", r"\1", value)
+        value = re.sub(r"(\\text\{[^{}]+\})\s+o\s+(\\mathbb\{R\})", r"\1 \\to \2", value)
+        value = re.sub(r"\\binom\{([^{},]+),([^{}]+)\}", r"\\{\1,\2\\}", value)
+        return re.sub(r"\s+", " ", value).strip()
+
+    def _v2_mechanistic_design_needs_repair(self, mechanisms: list[str]) -> bool:
+        items = [str(item or "").strip() for item in mechanisms if str(item or "").strip()]
+        if not items:
+            return True
+        generic = 0
+        unrendered_math = 0
+        for item in items:
+            lower = item.lower()
+            if re.match(r"^(this|the)\s+(node|derived node|lineage node)\b", lower):
+                generic += 1
+            elif "this node" in lower or "derivation node" in lower or "lineage node" in lower:
+                generic += 1
+            elif "is derived by applying" in lower or "derived by applying" in lower:
+                generic += 1
+            elif lower.startswith(("combines ", "specializes ", "contrasts ", "applies ", "revises ", "merges ", "critiques ", "prunes ")):
+                generic += 1
+            elif lower.startswith(("derived concept", "speculative l", "l0 ", "l1 ", "l2 ", "l3 ", "l4 ", "l5 ")):
+                generic += 1
+            elif self._v2_text_contains_structured_artifact(item):
+                generic += 1
+            if self._v2_has_unrendered_symbolic_math(item):
+                unrendered_math += 1
+        short_or_symbolic = sum(1 for item in items if len(item) < 70 or re.fullmatch(r"[A-Z0-9_.:-]{3,}", item))
+        return (
+            generic >= max(1, len(items) // 2)
+            or (generic and short_or_symbolic >= len(items) - 1)
+            or unrendered_math >= max(1, len(items) // 3)
+        )
+
+    def _v2_has_unrendered_symbolic_math(self, text: str) -> bool:
+        value = str(text or "")
+        if value.count("$") % 2 == 1:
+            return True
+        text_without_math = re.sub(
+            r"(\$\$[\s\S]+?\$\$|\$[^$\n]{1,700}\$|\\\[[\s\S]+?\\\]|\\\([^()\n]{1,700}\\\))",
+            " ",
+            value,
+        )
+        if re.search(r"(?<![$\\])\b[A-Z][A-Za-z0-9]?(?:_[A-Za-z0-9]+|\^[A-Za-z0-9]+)\b(?![^$]*\$)", text_without_math):
+            return True
+        if re.search(r"(?<![$\\])\b[A-Z][A-Za-z0-9]*_\{[^{}]+\}", text_without_math):
+            return True
+        if re.search(
+            r"\\(?:mathcal|mathbb|mathbf|mathrm|operatorname|frac|sqrt|sum|prod|int|lambda|alpha|beta|gamma|delta|theta|Theta|Phi|cdot|times)\b",
+            text_without_math,
+        ):
+            return True
+        return False
+
+    def _v2_text_contains_structured_artifact(self, text: str) -> bool:
+        value = str(text or "").strip()
+        if not value:
+            return False
+        if re.search(r"^\s*[\[{].*['\"](?:component|description|step|name|text|summary|mechanism)['\"]\s*:", value, flags=re.DOTALL):
+            return True
+        if re.search(r"['\"](?:component|description|step|name|text|summary|mechanism)['\"]\s*:\s*['\"]", value):
+            return True
+        return False
+
+    def _v2_methodology_mechanistic_design(self, idea: dict[str, Any]) -> list[str]:
+        title = compact_text(str(idea.get("title") or "the proposed method"), 140).rstrip(".")
+        thesis = compact_text(str(idea.get("one_sentence_thesis") or idea.get("novelty_claim") or title), 260).rstrip(".")
+        novelty = compact_text(str(idea.get("novelty_claim") or thesis), 260).rstrip(".")
+        source_bits: list[str] = []
+        for source in idea.get("source_concepts") or []:
+            if not isinstance(source, dict):
+                continue
+            source_bits.append(str(source.get("title") or source.get("summary") or ""))
+        for ref in idea.get("selected_refs") or []:
+            if isinstance(ref, dict):
+                source_bits.append(str(ref.get("title") or ref.get("label") or ref.get("id") or ""))
+        evidence_terms = keyword_terms(" ".join(source_bits + self._listify(idea.get("derived_principles")) + [thesis, novelty]), 8)
+        evidence_phrase = compact_text(", ".join(evidence_terms[:5]) or "the selected evidence", 120)
+        principle_text = compact_text("; ".join(self._listify(idea.get("derived_principles"))[:3]) or novelty or thesis, 320).rstrip(".")
+        baseline_text = compact_text("; ".join(self._listify(idea.get("relevant_baselines"))[:3]) or "the strongest selected baseline and the simplest ablated variant", 240).rstrip(".")
+        return [
+            f"Evidence representation. Build an evidence ledger for {title} in which each selected paper/concept contributes a reusable mechanism, an operating condition, and a known failure mode. The ledger emphasizes {evidence_phrase}, so the method is grounded in the selected material while still requiring a new design choice rather than a copied prior mechanism.",
+            f"Principle-conditioned module design. Translate the strongest derived principle into concrete modules, routing rules, losses, or evaluation gates. The operative rule is: {principle_text}. Each module must name the signal it consumes, the decision it changes, and the failure case it is meant to prevent.",
+            f"Adaptive branch-and-critique loop. Keep several candidate mechanisms under consideration, specialize each one against the goal, critique it against the evidence conditions, and prune it if it cannot support the thesis: {thesis}. This makes the design search adaptive instead of a fixed-depth derivation.",
+            "Decision rule. For every surviving candidate, record three plain-language quantities: goal fit, evidence support, and risk or invalidity. A candidate is allowed to advance only when a concrete mechanism change improves evidence support or reduces a named risk; broader wording alone is not accepted as progress.",
+            f"Validation protocol. Evaluate the final mechanism against {baseline_text}. The first experiment should isolate whether the proposed mechanism actually produces the claimed behavior in {novelty}, then run ablations that remove each principle-conditioned constraint.",
+        ]
 
     def _v1_repair_symbolic_legacy_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         repaired = dict(payload)
@@ -6096,10 +8590,52 @@ class PrincipiaEngine:
             exact = [variant for variant in variants.values() if variant.get("model_mode") == model_mode]
             if exact:
                 return sorted(exact, key=lambda variant: variant.get("extracted_at", ""), reverse=True)[0]
+        if model_mode == "auto":
+            cloud_variants = [
+                variant
+                for variant in variants.values()
+                if isinstance(variant, dict)
+                and (
+                    (isinstance(variant.get("payload"), dict) and isinstance(variant.get("payload", {}).get("cloud_origin"), dict))
+                    or isinstance(variant.get("cloud_origin"), dict)
+                )
+            ]
+            if cloud_variants:
+                return sorted(
+                    cloud_variants,
+                    key=lambda variant: (
+                        self._model_strength_rank(str(variant.get("model_mode") or "")),
+                        float(variant.get("confidence_score", 0) or 0),
+                        str(variant.get("extracted_at") or ""),
+                    ),
+                    reverse=True,
+                )[0]
         active = item.get("active_version_id", "")
         if active in variants:
             return variants[active]
         return sorted(variants.values(), key=lambda variant: (float(variant.get("confidence_score", 0) or 0), variant.get("extracted_at", "")), reverse=True)[0]
+
+    def _model_strength_rank(self, model_mode: str) -> int:
+        order = [
+            "openai_gpt55_pro_20260423",
+            "openai_gpt55",
+            "openai_gpt52_pro",
+            "openai_gpt5_pro",
+            "deepseek_pro",
+            "deepseek_r1",
+            "qwen_397b",
+            "kimi",
+            "glm",
+            "strong",
+            "qwen_122b",
+            "qwen_35b",
+            "qwen_27b",
+            "auto",
+        ]
+        try:
+            return len(order) - order.index(str(model_mode or ""))
+        except ValueError:
+            return 0
 
     def _v2_active_payload(self, item: dict[str, Any]) -> dict[str, Any]:
         return dict(self._v2_active_variant(item).get("payload") or item)
@@ -6195,6 +8731,9 @@ class PrincipiaEngine:
         return re.sub(r"[^a-z0-9]+", " ", self._normalize_pdf_text(text).lower()).strip()[:180]
 
     def _v2_find_by_key(self, bucket: str, canonical_key: str) -> dict[str, Any] | None:
+        finder = getattr(self.store, "find_by_canonical_key", None)
+        if callable(finder):
+            return finder(bucket, canonical_key)
         for item in self.store.list_items(bucket, limit=100000):
             if item.get("canonical_key") == canonical_key:
                 return item
@@ -6283,8 +8822,8 @@ class PrincipiaEngine:
         if model_mode.startswith("openai_"):
             return 1
         if model_mode in {"qwen_122b", "qwen_397b", "deepseek_pro", "deepseek_r1", "kimi", "glm"}:
-            return 2
-        return 2
+            return 5
+        return 3
 
     def _v2_llm_extract_batch(
         self,
@@ -6308,8 +8847,8 @@ class PrincipiaEngine:
             {
                 "work_id": work.get("work_id"),
                 "title": work.get("title"),
-                "abstract": compact_text(work.get("abstract", ""), 700),
-                "full_text_excerpt": compact_text(work.get("transient_full_text", ""), 4200),
+                "abstract": compact_text(self._normalize_pdf_text(work.get("abstract", "")), 700),
+                "full_text_excerpt": compact_text(self._normalize_pdf_text(work.get("transient_full_text", "")), 4200),
                 "venue_or_source": work.get("venue_or_source"),
                 "year": work.get("year"),
             }
@@ -6322,10 +8861,11 @@ class PrincipiaEngine:
         batches = [payload[idx : idx + batch_size] for idx in range(0, len(payload), batch_size)]
         extracted: dict[str, dict[str, Any]] = {}
         failures: list[str] = []
-        parallelism = min(self._v2_llm_parallelism(model_mode), len(batches))
+        parallelism = max(1, min(self._v2_llm_parallelism(model_mode), len(batches)))
 
-        def call_batch(batch_index: int, batch: list[dict[str, Any]]) -> tuple[int, dict[str, Any], int]:
+        def call_batch(batch_index: int, batch: list[dict[str, Any]]) -> tuple[int, dict[str, Any], int, bool]:
             attempts = 0
+            saw_rate_limit = False
             while True:
                 if cancel_check and cancel_check():
                     raise CancelledRun("Cancelled by user.")
@@ -6339,6 +8879,7 @@ class PrincipiaEngine:
                     "For a valuable work with a substantive method, result, or analysis in the full text, extract at least one general existed_idea unless the excerpt truly contains no reusable mechanism. Do not fabricate missing content. "
                     "A published technical work usually contains at least one existed idea: the mechanism, design choice, inference procedure, training/evaluation strategy, or analysis pattern that makes the work technically useful. Recover that idea in objective form instead of returning zero merely because it is not phrased as an 'idea' in the paper. "
                     "If it is valuable, extract the work's reusable ideas, principles, empirical lessons, benchmarks, and baselines broadly from the work itself rather than forcing every field to mention the goal. "
+                    "Repair PDF line-wrap hyphenation before writing any field: for example, output 'scientific tools', never 'scien- tific tools'. "
                     "Do not quote or summarize the paper's narrative. Rewrite into complete objective arguments. Every idea/principle/takeaway must stand alone without phrases like 'this paper', 'this work', 'we', 'our method', 'in this work', 'Figure 1', 'Table 2', 'thus', 'however', 'therefore', 'consequently', or 'extensive experiments demonstrate'. "
                     "Reject copyright/license/website boilerplate, objectives, contribution-list fragments, figure/table captions, and copied sentence fragments. "
                     "Existed ideas are the work's essential innovation mechanisms, not the paper title and not a literature-survey sentence. Each idea needs: core_idea as 1-2 objective, reusable, inspiring sentences; mechanism as 1-2 paragraphs explaining the technical implementation around that idea; discussion as 1-2 paragraphs analyzing value, limits, and principle-level implications. "
@@ -6371,12 +8912,13 @@ class PrincipiaEngine:
                         model_mode=model_mode,
                         cancel_check=cancel_check,
                     )
-                    return batch_index, result, attempts
+                    return batch_index, result, attempts, saw_rate_limit
                 except Exception as exc:
                     if isinstance(exc, CancelledRun):
                         raise
                     if attempts >= 2 or not self._v2_retryable_llm_error(exc):
                         raise
+                    saw_rate_limit = saw_rate_limit or self._v2_rate_limit_llm_error(exc)
                     time.sleep(1.5 * attempts)
                     if cancel_check and cancel_check():
                         raise CancelledRun("Cancelled by user.")
@@ -6388,45 +8930,59 @@ class PrincipiaEngine:
                 llm_batches_done=0,
                 llm_batches_total=len(batches),
                 llm_extracted_works=0,
+                llm_parallelism=parallelism,
             )
         completed = 0
         executor = ThreadPoolExecutor(max_workers=max(1, parallelism))
-        futures = {
-            executor.submit(call_batch, batch_index, batch): (batch_index, batch)
-            for batch_index, batch in enumerate(batches, start=1)
-        }
+        current_parallelism = parallelism
+        next_batch_index = 0
+        futures: dict[Any, tuple[int, list[dict[str, Any]]]] = {}
+
+        def submit_available() -> None:
+            nonlocal next_batch_index
+            while next_batch_index < len(batches) and len(futures) < current_parallelism:
+                batch_number = next_batch_index + 1
+                futures[executor.submit(call_batch, batch_number, batches[next_batch_index])] = (
+                    batch_number,
+                    batches[next_batch_index],
+                )
+                next_batch_index += 1
+
         try:
-            pending_futures = set(futures)
             heartbeat_started = time.time()
-            while pending_futures:
+            submit_available()
+            while futures:
                 if cancel_check and cancel_check():
-                    for pending in pending_futures:
+                    for pending in futures:
                         pending.cancel()
                     raise CancelledRun("Cancelled by user.")
-                done, pending_futures = wait(pending_futures, timeout=6, return_when=FIRST_COMPLETED)
+                done, _pending_futures = wait(set(futures), timeout=6, return_when=FIRST_COMPLETED)
                 if not done:
                     if progress_callback:
                         progress_callback(
                             "llm_extraction_wait",
-                            f"Waiting for {len(pending_futures)} LLM extractor batch(es); deterministic full-text records are already visible.",
+                            f"Waiting for {len(futures)} active LLM extractor batch(es); deterministic full-text records are already visible.",
                             llm_batches_done=completed,
                             llm_batches_total=len(batches),
                             llm_extracted_works=len(extracted),
                             llm_failed_batches=len(failures),
                             llm_wait_seconds=int(time.time() - heartbeat_started),
+                            llm_parallelism=current_parallelism,
                         )
                     continue
                 for future in done:
                     if cancel_check and cancel_check():
-                        for pending in pending_futures:
+                        for pending in futures:
                             pending.cancel()
                         raise CancelledRun("Cancelled by user.")
-                    batch_index, _batch = futures[future]
+                    batch_index, _batch = futures.pop(future)
                     completed += 1
                     try:
-                        _, result, attempts = future.result()
+                        _, result, attempts, saw_rate_limit = future.result()
                         if cancel_check and cancel_check():
                             raise CancelledRun("Cancelled by user.")
+                        if saw_rate_limit and current_parallelism > 1:
+                            current_parallelism -= 1
                         batch_extracted: dict[str, dict[str, Any]] = {}
                         for item in result.get("works", []):
                             if item.get("work_id"):
@@ -6436,28 +8992,43 @@ class PrincipiaEngine:
                             batch_result_callback(batch_extracted)
                         if progress_callback:
                             retry_note = f" after {attempts} attempts" if attempts > 1 else ""
+                            throttle_note = (
+                                f"; adaptive concurrency is now {current_parallelism}"
+                                if saw_rate_limit and current_parallelism < parallelism
+                                else ""
+                            )
                             progress_callback(
                                 "llm_extraction",
-                                f"LLM extractor batch {batch_index}/{len(batches)} complete{retry_note}.",
+                                f"LLM extractor batch {batch_index}/{len(batches)} complete{retry_note}{throttle_note}.",
                                 llm_batches_done=completed,
                                 llm_batches_total=len(batches),
                                 llm_extracted_works=len(extracted),
+                                llm_parallelism=current_parallelism,
                             )
                     except Exception as exc:
                         if isinstance(exc, CancelledRun):
-                            for pending in pending_futures:
+                            for pending in futures:
                                 pending.cancel()
                             raise
+                        if self._v2_rate_limit_llm_error(exc) and current_parallelism > 1:
+                            current_parallelism -= 1
                         failures.append(f"batch {batch_index}/{len(batches)}: {self._friendly_llm_error(exc)}")
                         if progress_callback:
+                            throttle_note = (
+                                f" Adaptive concurrency reduced to {current_parallelism}."
+                                if self._v2_rate_limit_llm_error(exc)
+                                else ""
+                            )
                             progress_callback(
                                 "llm_extraction",
-                                f"LLM extractor batch {batch_index}/{len(batches)} failed; continuing with remaining batches.",
+                                f"LLM extractor batch {batch_index}/{len(batches)} failed; continuing with remaining batches.{throttle_note}",
                                 llm_batches_done=completed,
                                 llm_batches_total=len(batches),
                                 llm_extracted_works=len(extracted),
                                 llm_failed_batches=len(failures),
+                                llm_parallelism=current_parallelism,
                             )
+                    submit_available()
         finally:
             executor.shutdown(wait=not (cancel_check and cancel_check()), cancel_futures=bool(cancel_check and cancel_check()))
         if failures:
@@ -6799,7 +9370,30 @@ class PrincipiaEngine:
         text = str(exc).lower()
         if any(term in text for term in ["insufficient_quota", "invalid_api_key", "no api key", "cost guard", "model_not_found"]):
             return False
-        return any(term in text for term in ["timed out", "timeout", "temporarily", "connection reset", "remote end closed", "http 502", "http 503", "http 504", "rate limit"])
+        return any(
+            term in text
+            for term in [
+                "timed out",
+                "timeout",
+                "temporarily",
+                "connection reset",
+                "remote end closed",
+                "http 429",
+                "too many requests",
+                "rate limit",
+                "rate_limit",
+                "resource_exhausted",
+                "http 502",
+                "http 503",
+                "http 504",
+            ]
+        )
+
+    def _v2_rate_limit_llm_error(self, exc: Exception) -> bool:
+        text = str(exc).lower()
+        if any(term in text for term in ["insufficient_quota", "invalid_api_key", "no api key"]):
+            return False
+        return any(term in text for term in ["http 429", "too many requests", "rate limit", "rate_limit", "resource_exhausted"])
 
     def _friendly_llm_error(self, exc: Exception) -> str:
         text = str(exc)
@@ -6824,7 +9418,7 @@ class PrincipiaEngine:
             return (
                 "Reason: the model request completed but did not include final JSON text. Principia now requests JSON-formatted output and minimal reasoning for OpenAI GPT-5-family calls; retry with a larger output budget if this repeats."
             )
-        if "http 429" in lower:
+        if any(term in lower for term in ["http 429", "too many requests", "rate limit", "rate_limit", "resource_exhausted"]):
             return "Reason: the LLM provider rate-limited or quota-limited the request."
         return f"Reason: {text}"
 
@@ -6857,7 +9451,8 @@ class PrincipiaEngine:
     def _v2_rank_related_candidates(self, idea: dict[str, Any], existed: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
         body = " ".join([idea.get("title", ""), idea.get("one_sentence_thesis", ""), idea.get("novelty_claim", ""), " ".join(idea.get("mechanistic_design", []))])
         scored = []
-        for item in existed:
+        deduped_existed = self._v2_dedupe_related_candidate_items(existed)
+        for item in deduped_existed:
             text = " ".join([item.get("title", ""), item.get("core_idea", ""), item.get("idea_text", ""), item.get("summary", ""), item.get("mechanism", "")])
             score = lexical_score(body, text)
             if score <= 0:
@@ -6867,7 +9462,7 @@ class PrincipiaEngine:
         seen_ids = {item.get("canonical_id", "") for _, item in scored}
         limit = max(1, min(int(limit or 24), 24))
         if len(scored) < limit:
-            for item in existed:
+            for item in deduped_existed:
                 item_id = item.get("canonical_id", "")
                 if item_id in seen_ids:
                     continue
@@ -6896,7 +9491,8 @@ class PrincipiaEngine:
         _ = allow_heuristic
         body = " ".join([idea.get("title", ""), idea.get("one_sentence_thesis", ""), idea.get("novelty_claim", ""), " ".join(idea.get("mechanistic_design", []))])
         scored = []
-        for item in existed:
+        deduped_existed = self._v2_dedupe_related_candidate_items(existed)
+        for item in deduped_existed:
             text = " ".join([item.get("title", ""), item.get("core_idea", ""), item.get("idea_text", ""), item.get("summary", ""), item.get("mechanism", "")])
             score = lexical_score(body, text)
             if score <= 0:
@@ -6906,7 +9502,7 @@ class PrincipiaEngine:
         seen_ids = {item.get("canonical_id", "") for _, item, _ in scored}
         limit = max(1, min(int(limit or 24), 24))
         if len(scored) < limit:
-            for item in existed:
+            for item in deduped_existed:
                 item_id = item.get("canonical_id", "")
                 if item_id in seen_ids:
                     continue
@@ -6966,7 +9562,7 @@ class PrincipiaEngine:
                         if row:
                             output.append(row)
                     if output and not self._v2_rows_are_repetitive(output):
-                        return output
+                        return self._v2_dedupe_related_rows(output)
                     prior_attempt_note = (
                         "The previous answer was rejected because it used repeated phrasing or insufficiently specific row-level reasoning. "
                         "Rewrite from scratch with visibly different sentence structure per row."
@@ -6975,6 +9571,49 @@ class PrincipiaEngine:
                     self._last_v2_related_error = self._friendly_llm_error(exc)
                     break
         return []
+
+    def _v2_dedupe_related_candidate_items(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        output: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in items or []:
+            key = self._v2_related_item_key(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            output.append(item)
+        return output
+
+    def _v2_related_item_key(self, item: dict[str, Any]) -> str:
+        title = self._v2_canonical_key(str(item.get("title") or item.get("name") or ""))
+        source = self._v2_canonical_key(str(item.get("source_paper_title") or item.get("source_work_title") or ""))
+        if title:
+            return f"title:{title}|source:{source}"
+        canonical_id = str(item.get("canonical_id") or item.get("id") or "").strip()
+        if canonical_id:
+            return f"id:{canonical_id}"
+        body = self._v2_argument_key(str(item.get("core_idea") or item.get("idea_text") or item.get("summary") or item.get("mechanism") or ""))
+        return f"source:{source}|body:{body[:80]}"
+
+    def _v2_dedupe_related_rows(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        output: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for row in rows or []:
+            key = self._v2_related_row_key(row)
+            if key in seen:
+                continue
+            seen.add(key)
+            output.append(row)
+        return output
+
+    def _v2_related_row_key(self, row: dict[str, Any]) -> str:
+        title = self._v2_canonical_key(str(row.get("title") or ""))
+        source = self._v2_canonical_key(str(row.get("source_paper_title") or ""))
+        if title:
+            return f"title:{title}|source:{source}"
+        canonical_id = str(row.get("id") or row.get("canonical_id") or "").strip()
+        if canonical_id:
+            return f"id:{canonical_id}"
+        return f"title:{title}|source:{source}"
 
     def _related_comparison_timeout(self, model_mode: str, base_seconds: int) -> int:
         mode = str(model_mode or "").lower()
@@ -7255,7 +9894,7 @@ class PrincipiaEngine:
         for bucket in buckets:
             id_key = self._record_id_key(bucket)
             for raw in data.get(bucket, {}).values():
-                item = self._v2_present_item(raw, model_mode=model_mode)
+                item = self._v2_present_item(raw, model_mode=model_mode, include_work_counts=False)
                 record_id = str(item.get(id_key) or item.get("canonical_id") or "")
                 if not record_id:
                     continue
@@ -7269,10 +9908,97 @@ class PrincipiaEngine:
 
     def _listify(self, value: Any) -> list[str]:
         if isinstance(value, list):
-            return [compact_text(str(item), 420) for item in value if str(item).strip()]
+            return [
+                text
+                for item in value
+                if (text := self._v2_plain_list_item(item))
+            ]
+        if isinstance(value, dict):
+            text = self._v2_plain_list_item(value)
+            return [text] if text else []
         if isinstance(value, str) and value.strip():
+            parsed = self._v2_parse_structured_text(value)
+            if parsed is not None:
+                return self._listify(parsed)
             return [compact_text(value, 420)]
         return []
+
+    def _v2_plain_list_item(self, item: Any) -> str:
+        if item is None:
+            return ""
+        if isinstance(item, str):
+            parsed = self._v2_parse_structured_text(item)
+            if parsed is not None:
+                return self._v2_plain_list_item(parsed)
+            return compact_text(item, 420).strip()
+        if isinstance(item, (int, float)):
+            return compact_text(str(item), 420).strip()
+        if isinstance(item, list):
+            parts = [self._v2_plain_list_item(part) for part in item]
+            return compact_text("; ".join(part for part in parts if part), 420).strip()
+        if isinstance(item, dict):
+            return self._v2_plain_structured_item(item)
+        return compact_text(str(item), 420).strip()
+
+    def _v2_parse_structured_text(self, value: str) -> Any | None:
+        text = str(value or "").strip()
+        if not text or not re.match(r"^[\[{]", text):
+            return None
+        if not self._v2_text_contains_structured_artifact(text):
+            return None
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            try:
+                parsed = ast.literal_eval(text)
+            except Exception:
+                return None
+        if isinstance(parsed, (dict, list)):
+            return parsed
+        return None
+
+    def _v2_plain_structured_item(self, item: dict[str, Any]) -> str:
+        label = compact_text(
+            str(
+                item.get("component")
+                or item.get("step")
+                or item.get("name")
+                or item.get("title")
+                or item.get("module")
+                or item.get("operator")
+                or item.get("role")
+                or ""
+            ),
+            90,
+        ).strip(" .:-")
+        body_value = (
+            item.get("description")
+            or item.get("text")
+            or item.get("summary")
+            or item.get("mechanism")
+            or item.get("argument")
+            or item.get("rationale")
+            or item.get("detail")
+            or item.get("details")
+            or item.get("method")
+        )
+        body = self._v2_plain_list_item(body_value) if body_value is not None else ""
+        if not body:
+            scalar_parts = []
+            for key, value in item.items():
+                if key in {"component", "step", "name", "title", "module", "operator", "role"}:
+                    continue
+                text = self._v2_plain_list_item(value)
+                if text:
+                    scalar_parts.append(f"{str(key).replace('_', ' ').title()}: {text}")
+            body = "; ".join(scalar_parts)
+        if label and body:
+            return compact_text(f"{label}. {body}", 520).strip()
+        if body:
+            return compact_text(body, 520).strip()
+        if label:
+            return compact_text(label, 420).strip()
+        return ""
 
     def assemble_idea(
         self,
@@ -8399,11 +11125,7 @@ class PrincipiaEngine:
     ) -> list[dict[str, Any]]:
         if field_id == "default":
             return []
-        current = [
-            item
-            for item in self.store.list_items("project_memberships", limit=100000)
-            if item.get("field_id") == field_id and item.get("bucket") == bucket
-        ]
+        current = self.store.list_project_memberships(field_id, bucket, include_hidden=True)
         existing = {item.get("record_id"): item for item in current}
         orders = [int(item.get("display_order", 0) or 0) for item in current]
         next_order = (min(orders) - len(record_ids)) if (prepend and orders) else ((max(orders) + 1) if orders else 0)

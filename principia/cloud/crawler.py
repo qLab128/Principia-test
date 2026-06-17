@@ -9,7 +9,7 @@ from typing import Any
 
 from ..research_sources import search_hybrid_sources
 from ..models import utc_now
-from ..utils import compact_text, lexical_score, stable_id
+from ..utils import compact_text, enrich_query, lexical_score, query_expansions, stable_id, tokenize
 
 
 VENUE_ALIASES = {
@@ -50,6 +50,24 @@ OPENREVIEW_VENUE_PREFIXES = {
 
 OPENREVIEW_API = "https://api2.openreview.net/notes"
 OPENREVIEW_USER_AGENT = "Principia-v1.1-cloud-crawler (local research workspace)"
+OTHER_FILTER_VALUE = "__other__"
+DEFAULT_KNOWN_VENUES = [
+    "ICLR",
+    "NeurIPS",
+    "ICML",
+    "CVPR",
+    "ACL",
+    "ICCV",
+    "ECCV",
+    "EMNLP",
+    "AAAI",
+    "TPAMI",
+    "JMLR",
+    "Nature",
+    "Science",
+    "Nature Machine Intelligence",
+    "Nature Computational Science",
+]
 
 
 @dataclass
@@ -63,10 +81,30 @@ def normalize_venue(value: str) -> str:
     return VENUE_ALIASES.get(text.lower(), text)
 
 
+def _expand_topics(topics: list[str] | None) -> list[str]:
+    output: list[str] = []
+    for raw in topics or []:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        output.append(text)
+        if "^" in text:
+            output.append(text.replace("^", ""))
+            output.append(text.replace("^", " "))
+        compacted = "".join(ch for ch in text.lower() if ch.isalnum())
+        if compacted == "vit3":
+            output.extend(["VIT3", "ViT3", "VIT 3", "ViT 3", "vision transformer 3", "vision transformer cubed"])
+    return _unique_strings(output)
+
+
 def plan_crawl(
     *,
     venues: list[str],
     years: list[int],
+    venue_other: bool = False,
+    known_venues: list[str] | None = None,
+    year_other: bool = False,
+    known_years: list[int] | None = None,
     topics: list[str] | None = None,
     priority_rules: list[str] | None = None,
     max_papers: int = 100,
@@ -75,28 +113,45 @@ def plan_crawl(
     live: bool = False,
     timeout: int = 12,
 ) -> dict[str, Any]:
-    topics = topics or []
+    topics = _expand_topics(topics or [])
     priority_rules = priority_rules or ["venue", "recency", "topic"]
-    normalized = [normalize_venue(venue) for venue in venues if venue]
+    normalized = [normalize_venue(venue) for venue in venues if str(venue or "").strip() and str(venue or "").strip() != OTHER_FILTER_VALUE]
+    normalized = _unique_strings(normalized)
+    known_venue_values = _unique_strings([normalize_venue(item) for item in (known_venues or DEFAULT_KNOWN_VENUES) if item])
+    normalized_years = _unique_ints(years)
+    known_year_values = _unique_ints(known_years or [])
     max_papers = max(1, min(int(max_papers or 100), 1000))
     metadata_warnings: list[str] = []
     candidates = _live_metadata_candidates(
         venues=normalized,
-        years=years,
+        venue_other=venue_other,
+        known_venues=known_venue_values,
+        years=normalized_years,
+        year_other=year_other,
+        known_years=known_year_values,
         topics=topics,
         priority_rules=priority_rules,
         max_papers=max_papers,
         timeout=timeout,
         warnings=metadata_warnings,
     ) if live else []
-    candidates = _filter_candidates(candidates, normalized, years)
+    candidates = _filter_candidates(
+        candidates,
+        normalized,
+        normalized_years,
+        topics,
+        venue_other=venue_other,
+        known_venues=known_venue_values,
+        year_other=year_other,
+        known_years=known_year_values,
+    )
     if live and not candidates:
         metadata_warnings.append(
             "No public metadata candidates matched the selected venue/year filters. "
             "The live crawler will not fabricate template papers."
         )
     if not live and not candidates:
-        candidates = _fallback_candidates(normalized, years, topics, priority_rules, max_papers, live=live)
+        candidates = _fallback_candidates(normalized, normalized_years, topics, priority_rules, max_papers, live=live)
     candidates.sort(key=lambda item: item["priority_score"], reverse=True)
     candidates = candidates[:max_papers]
     return {
@@ -104,7 +159,11 @@ def plan_crawl(
         "created_at": utc_now(),
         "dry_run": dry_run,
         "venues": normalized,
-        "years": years,
+        "venue_other": venue_other,
+        "known_venues": known_venue_values,
+        "years": normalized_years,
+        "year_other": year_other,
+        "known_years": known_year_values,
         "topics": topics,
         "priority_rules": priority_rules,
         "model_key": model_key,
@@ -121,14 +180,18 @@ def plan_crawl(
 def _live_metadata_candidates(
     *,
     venues: list[str],
+    venue_other: bool,
+    known_venues: list[str],
     years: list[int],
+    year_other: bool,
+    known_years: list[int],
     topics: list[str],
     priority_rules: list[str],
     max_papers: int,
     timeout: int,
     warnings: list[str],
 ) -> list[dict[str, Any]]:
-    queries = _metadata_queries(venues, years, topics)
+    queries = _metadata_queries(venues, years, topics, venue_other=venue_other, year_other=year_other, known_years=known_years)
     if not queries:
         return []
     seen: set[str] = set()
@@ -165,20 +228,25 @@ def _live_metadata_candidates(
             if query_year and year and year != query_year:
                 continue
             year = year or query_year
-            if query.get("venue") and not _candidate_matches_venue(raw_venue, title, candidate.get("abstract") or "", str(query["venue"])):
+            abstract = compact_text(candidate.get("abstract") or "", 2400)
+            if query.get("venue") and not _candidate_matches_venue(raw_venue, title, abstract, str(query["venue"])):
+                continue
+            topic_score = _candidate_topic_score({**candidate, "title": title, "abstract": abstract}, topics)
+            if topics and not _candidate_matches_topics({**candidate, "title": title, "abstract": abstract}, topics, topic_score=topic_score):
                 continue
             venue = _best_candidate_venue(raw_venue, str(query.get("venue") or ""))
             candidate.update(
                 {
                     "work_id": candidate.get("work_id") or stable_id("W", title),
                     "title": title,
-                    "abstract": compact_text(candidate.get("abstract") or "", 2400),
+                    "abstract": abstract,
                     "year": year,
                     "venue_or_source": venue or query["venue"],
                     "source_type": candidate.get("source_type") or "paper",
                     "source_provider": candidate.get("source_provider") or "hybrid_public_metadata",
                     "source_record_id": candidate.get("source_record_id") or stable_id("SRC", title, venue, year),
-                    "priority_score": _metadata_priority(candidate, query, idx, topics, priority_rules),
+                    "topic_score": topic_score,
+                    "priority_score": _metadata_priority({**candidate, "topic_score": topic_score}, query, idx, topics, priority_rules),
                     "priority_reason": _priority_reason(candidate, query, topics, priority_rules),
                     "target_venue": query["venue"],
                     "target_year": query["year"],
@@ -229,7 +297,9 @@ def _openreview_candidates(
         keywords = _openreview_value(content, "keywords") or []
         forum_id = str(note.get("forum") or note.get("id") or "")
         text = " ".join([title, abstract, " ".join(keywords if isinstance(keywords, list) else [])])
-        topic_score = lexical_score(topic_text, text) if topic_text else 0.1
+        topic_score = _candidate_topic_score({"title": title, "abstract": abstract, "community_signals": {"keywords": keywords}}, topics) if topic_text else 0.1
+        if topics and not _candidate_matches_topics({"title": title, "abstract": abstract, "community_signals": {"keywords": keywords}}, topics, topic_score=topic_score):
+            continue
         candidate = {
             "work_id": stable_id("W", title),
             "title": title,
@@ -244,6 +314,7 @@ def _openreview_candidates(
             "source_urls": [f"https://openreview.net/forum?id={forum_id}"] if forum_id else [],
             "source_updated_at": str(note.get("mdate") or note.get("tmdate") or ""),
             "community_signals": {"source": "openreview", "venueid": venue_id, "keywords": keywords},
+            "topic_score": round(topic_score, 4),
             "priority_score": round(_priority_score(canonical, year, idx, topics, priority_rules) + 0.35 * topic_score, 4),
             "priority_reason": _priority_reason({"venue_or_source": canonical}, {"venue": canonical, "year": year}, topics, priority_rules),
             "target_venue": canonical,
@@ -275,42 +346,157 @@ def _fetch_openreview_json(url: str, timeout: int) -> dict[str, Any]:
             return json.loads(response.read().decode("utf-8", errors="replace"))
 
 
-def _filter_candidates(candidates: list[dict[str, Any]], venues: list[str], years: list[int]) -> list[dict[str, Any]]:
+def _filter_candidates(
+    candidates: list[dict[str, Any]],
+    venues: list[str],
+    years: list[int],
+    topics: list[str] | None = None,
+    *,
+    venue_other: bool = False,
+    known_venues: list[str] | None = None,
+    year_other: bool = False,
+    known_years: list[int] | None = None,
+) -> list[dict[str, Any]]:
     if not candidates:
         return []
     selected_years = {_safe_int(year) for year in years if _safe_int(year)}
+    known_year_set = {_safe_int(year) for year in (known_years or []) if _safe_int(year)}
+    known_venue_values = _unique_strings([normalize_venue(item) for item in (known_venues or DEFAULT_KNOWN_VENUES) if item])
     output = []
     for candidate in candidates:
         venue_text = str(candidate.get("venue_or_source") or candidate.get("venue") or candidate.get("target_venue") or "")
         title = str(candidate.get("title") or "")
         abstract = str(candidate.get("abstract") or "")
-        if venues and not any(_candidate_matches_venue(venue_text, title, abstract, venue) for venue in venues):
+        matches_selected_venue = any(_candidate_matches_venue(venue_text, title, abstract, venue) for venue in venues)
+        matches_known_venue = any(_candidate_matches_venue(venue_text, title, abstract, venue) for venue in known_venue_values)
+        matches_other_venue = venue_other and not matches_known_venue
+        if (venues or venue_other) and not (matches_selected_venue or matches_other_venue):
             continue
         year = _safe_int(candidate.get("year") or candidate.get("target_year"))
-        if selected_years and year and year not in selected_years:
+        matches_selected_year = bool(year and year in selected_years)
+        matches_other_year = bool(year_other and (not year or year not in known_year_set))
+        if (selected_years or year_other) and not (matches_selected_year or matches_other_year):
+            continue
+        if topics and not _candidate_matches_topics(candidate, topics):
             continue
         output.append(candidate)
     return output
+
+
+def _candidate_matches_topics(candidate: dict[str, Any], topics: list[str], *, topic_score: float | None = None) -> bool:
+    if not topics:
+        return True
+    score = _candidate_topic_score(candidate, topics) if topic_score is None else float(topic_score)
+    if _is_test_time_scaling_topic(topics):
+        return _matches_test_time_scaling(candidate, score)
+    if score >= 0.08:
+        return True
+    text = _topic_candidate_text(candidate).lower()
+    phrases = _topic_phrases(topics)
+    if any(phrase and phrase in text for phrase in phrases):
+        return True
+    topic_tokens = [token for token in tokenize(enrich_query(" ".join(topics))) if len(token) >= 4]
+    if len(topic_tokens) >= 2:
+        present = sum(1 for token in set(topic_tokens) if token in text)
+        return present >= max(2, min(len(set(topic_tokens)), 3))
+    return False
+
+
+def _is_test_time_scaling_topic(topics: list[str]) -> bool:
+    normalized = " ".join(str(item or "").lower().replace("-", " ") for item in topics)
+    return (
+        "test time scaling" in normalized
+        or "inference time scaling" in normalized
+        or ("test time" in normalized and "scal" in normalized)
+        or ("inference" in normalized and "compute" in normalized)
+    )
+
+
+def _matches_test_time_scaling(candidate: dict[str, Any], score: float) -> bool:
+    text = _topic_candidate_text(candidate).lower().replace("-", " ")
+    phrases = (
+        "test time scaling",
+        "test time compute",
+        "inference time scaling",
+        "inference time compute",
+        "inference compute scaling",
+        "scaling inference compute",
+    )
+    if any(phrase in text for phrase in phrases):
+        return True
+    has_test_time = "test time" in text or "inference time" in text
+    has_scaling = any(term in text for term in ("scaling", "scale", "compute budget", "additional compute", "adaptive compute"))
+    return bool(has_test_time and has_scaling and score >= 0.12)
+
+
+def _candidate_topic_score(candidate: dict[str, Any], topics: list[str]) -> float:
+    if not topics:
+        return 0.0
+    topic_text = enrich_query(" ".join(str(item) for item in topics if item))
+    text = _topic_candidate_text(candidate)
+    score = lexical_score(topic_text, text)
+    lower = text.lower()
+    for raw_topic in topics:
+        phrase = str(raw_topic or "").lower().replace("-", " ").strip()
+        if phrase and phrase in lower.replace("-", " "):
+            score = max(score, 0.55)
+        compact_phrase = "".join(ch for ch in phrase if ch.isalnum())
+        compact_text_value = "".join(ch for ch in lower if ch.isalnum())
+        if compact_phrase and compact_phrase in compact_text_value:
+            score = max(score, 0.55)
+    return round(score, 4)
+
+
+def _topic_candidate_text(candidate: dict[str, Any]) -> str:
+    signals = candidate.get("community_signals") if isinstance(candidate.get("community_signals"), dict) else {}
+    return " ".join(
+        [
+            str(candidate.get("title") or ""),
+            str(candidate.get("abstract") or ""),
+            str(candidate.get("venue_or_source") or ""),
+            json.dumps(signals, ensure_ascii=False) if signals else "",
+        ]
+    )
+
+
+def _topic_phrases(topics: list[str]) -> list[str]:
+    output: list[str] = []
+    for raw in topics:
+        text = str(raw or "").strip()
+        if text:
+            output.append(text)
+        output.extend(query_expansions(text))
+    normalized: list[str] = []
+    for phrase in output:
+        cleaned = " ".join(str(phrase or "").lower().replace("-", " ").split())
+        if len(cleaned) >= 4 and cleaned not in normalized:
+            normalized.append(cleaned)
+    return normalized
 
 
 def _best_candidate_venue(raw_venue: str, target_venue: str) -> str:
     raw = str(raw_venue or "").strip()
     target = normalize_venue(target_venue)
     if raw and _candidate_matches_venue(raw, "", "", target):
-        return normalize_venue(raw)
+        return target or normalize_venue(raw)
     return target or normalize_venue(raw)
 
 
 def _candidate_matches_venue(raw_venue: str, title: str, abstract: str, target_venue: str) -> bool:
+    _ = (title, abstract)
     target = normalize_venue(target_venue)
     if not target:
         return True
     target_keys = _venue_match_keys(target)
-    text = _venue_key(" ".join([str(raw_venue or ""), str(title or ""), str(abstract or "")]))
-    if any(key and key in text for key in target_keys):
-        return True
     raw = normalize_venue(raw_venue)
-    return bool(raw and _venue_key(raw) in target_keys)
+    raw_key = _venue_key(raw or raw_venue)
+    if not raw_key:
+        return False
+    if raw_key in target_keys:
+        return True
+    if target in {"Nature", "Science"}:
+        return False
+    return any(key and key in raw_key for key in target_keys)
 
 
 def _venue_match_keys(value: str) -> set[str]:
@@ -326,14 +512,36 @@ def _venue_key(value: str) -> str:
     return "".join(char.lower() for char in str(value or "") if char.isalnum())
 
 
-def _metadata_queries(venues: list[str], years: list[int], topics: list[str]) -> list[dict[str, Any]]:
+def _metadata_queries(
+    venues: list[str],
+    years: list[int],
+    topics: list[str],
+    *,
+    venue_other: bool = False,
+    year_other: bool = False,
+    known_years: list[int] | None = None,
+) -> list[dict[str, Any]]:
     normalized_years = [int(year) for year in years if _safe_int(year)]
     topic_text = " ".join(topics).strip()
     queries: list[dict[str, Any]] = []
-    for venue in venues or ["AI machine learning"]:
+    for venue in venues:
         for year in normalized_years or []:
             base = " ".join(part for part in [topic_text, venue, str(year), "AI machine learning research paper"] if part)
             queries.append({"query": base, "venue": venue, "year": year})
+    if venue_other:
+        generic_years = normalized_years
+        if year_other and not generic_years:
+            generic_years = []
+        for year in generic_years:
+            base = " ".join(part for part in [topic_text, str(year), "AI machine learning research paper"] if part)
+            queries.append({"query": base, "venue": "", "year": year})
+        if not generic_years:
+            base = " ".join(part for part in [topic_text, "AI machine learning research paper"] if part)
+            queries.append({"query": base, "venue": "", "year": None})
+    elif year_other and not queries:
+        known = " ".join(str(item) for item in _unique_ints(known_years or [])[-3:])
+        base = " ".join(part for part in [topic_text, "recent AI machine learning research paper", known] if part)
+        queries.append({"query": base, "venue": "", "year": None})
     if not queries and topic_text:
         queries.append({"query": f"{topic_text} AI machine learning research paper", "venue": "", "year": None})
     return queries[: max(1, min(len(queries), 24))]
@@ -389,7 +597,7 @@ def _metadata_priority(candidate: dict[str, Any], query: dict[str, Any], idx: in
     if _safe_int(query.get("year")) and _safe_int(query.get("year")) == year:
         score += 0.1
     if topics:
-        score += 0.18 * lexical_score(" ".join(topics), text)
+        score += 0.42 * float(candidate.get("topic_score") or lexical_score(enrich_query(" ".join(topics)), text))
     if "citation" in rules or "citations" in rules:
         try:
             score += min(float(candidate.get("citation_count") or 0), 5000.0) / 5000.0 * 0.16
@@ -405,7 +613,8 @@ def _priority_reason(candidate: dict[str, Any], query: dict[str, Any], topics: l
     if candidate.get("citation_count") is not None:
         parts.append(f"citations={candidate.get('citation_count')}")
     if topics:
-        parts.append("topic_match")
+        topic_score = candidate.get("topic_score")
+        parts.append(f"topic_match={float(topic_score):.2f}" if isinstance(topic_score, (int, float)) else "topic_match")
     if query.get("venue"):
         parts.append(f"target={query.get('venue')} {query.get('year') or ''}".strip())
     return " / ".join(part for part in parts if part)
@@ -416,6 +625,33 @@ def _safe_int(value: Any) -> int | None:
         return int(value)
     except Exception:
         return None
+
+
+def _unique_strings(values: list[Any]) -> list[str]:
+    output: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text == OTHER_FILTER_VALUE:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(text)
+    return output
+
+
+def _unique_ints(values: list[Any]) -> list[int]:
+    output: list[int] = []
+    seen: set[int] = set()
+    for value in values:
+        number = _safe_int(value)
+        if number is None or number in seen:
+            continue
+        seen.add(number)
+        output.append(number)
+    return output
 
 
 def _priority_score(venue: str, year: int, idx: int, topics: list[str], priority_rules: list[str]) -> float:

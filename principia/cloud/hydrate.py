@@ -4,15 +4,16 @@ import json
 from typing import Any
 
 from ..global_store import GlobalStore
-from ..models import utc_now
+from ..models import ProjectMembership, to_dict, utc_now
 from ..storage import Store
 from ..utils import compact_text, stable_id
+from ..work_versioning import model_key as build_model_key
 
 
 LEGACY_BUCKET_BY_CONCEPT = {
     "principle": ("principles", "principle_id"),
-    "existed_idea": ("existed_ideas", "idea_id"),
-    "takeaway_message": ("takeaway_messages", "message_id"),
+    "existed_idea": ("existed_ideas", "canonical_id"),
+    "takeaway_message": ("takeaway_messages", "canonical_id"),
     "benchmark": ("benchmark_records", "benchmark_id"),
     "baseline": ("baseline_records", "baseline_id"),
     "result_fact": ("result_records", "result_id"),
@@ -33,6 +34,7 @@ class CloudHydrator:
         if self.store:
             legacy = {**work_payload, "work_id": saved_work.get("work_id") or work_payload.get("work_id"), "cloud_origin": origin}
             self.store.upsert("source_works", legacy, "work_id")
+            self._add_legacy_project_membership(project_id, "source_works", str(legacy.get("work_id") or ""))
         for version in work_record.get("work_versions") or bundle.get("work_versions") or []:
             self.global_store.upsert_work({**work_payload, **self._version_payload(version), "work_id": saved_work.get("work_id")})
         for extraction in work_record.get("extraction_runs") or bundle.get("extraction_runs") or []:
@@ -69,6 +71,34 @@ class CloudHydrator:
                     "confidence": link.get("confidence") or support.get("confidence_score") or 0.5,
                 }
             )
+        if not evidence:
+            support_work_ids = self._supporting_work_ids(record, payload, support)
+            if support_work_ids:
+                payload.setdefault("source_work_ids", support_work_ids)
+                payload.setdefault("source_works", support_work_ids)
+            evidence_text = (
+                payload.get("evidence")
+                or payload.get("abstract_signature")
+                or payload.get("core_idea")
+                or payload.get("idea_text")
+                or payload.get("message_text")
+                or payload.get("argument")
+                or payload.get("summary")
+                or record.get("canonical_label")
+                or payload.get("title")
+                or payload.get("name")
+                or ""
+            )
+            for work_id in support_work_ids:
+                evidence.append(
+                    {
+                        "work_id": work_id,
+                        "evidence_type": "cloud_supporting_work",
+                        "evidence_span": compact_text(str(evidence_text or ""), 1200),
+                        "source_url": (payload.get("source_paper_link") or (payload.get("source_paper_links") or [""])[0]) if isinstance(payload.get("source_paper_links"), list) else payload.get("source_paper_link") or "",
+                        "confidence": support.get("confidence_score") or payload.get("confidence_score") or 0.5,
+                    }
+                )
         concept = self.global_store.upsert_concept(
             str(record.get("concept_type") or payload.get("concept_type") or "takeaway_message"),
             payload,
@@ -89,7 +119,10 @@ class CloudHydrator:
             if bucket_info:
                 bucket, id_key = bucket_info
                 legacy = {**payload, id_key: payload.get(id_key) or concept.get("concept_id"), "concept_id": concept.get("concept_id"), "field_id": project_id, "cloud_origin": origin}
+                if bucket in {"existed_ideas", "takeaway_messages"}:
+                    legacy["canonical_id"] = legacy.get("canonical_id") or concept.get("concept_id")
                 self.store.upsert(bucket, legacy, id_key)
+                self._add_legacy_project_membership(project_id, bucket, str(legacy.get(id_key) or ""))
                 for link in evidence:
                     work_id = str(link.get("work_id") or "")
                     if not work_id:
@@ -111,6 +144,44 @@ class CloudHydrator:
                         "link_id",
                     )
         return concept
+
+    def _supporting_work_ids(self, record: dict[str, Any], payload: dict[str, Any], support: dict[str, Any]) -> list[str]:
+        ids: list[str] = []
+        for value in (
+            support.get("supporting_work_ids"),
+            record.get("supporting_work_ids"),
+            record.get("source_work_ids"),
+            record.get("source_works"),
+            payload.get("source_work_ids"),
+            payload.get("source_works"),
+        ):
+            if isinstance(value, list):
+                ids.extend(str(item) for item in value if item)
+            elif value:
+                ids.append(str(value))
+        return list(dict.fromkeys([item for item in ids if item]))
+
+    def _add_legacy_project_membership(self, project_id: str, bucket: str, record_id: str) -> None:
+        if not self.store or not project_id or project_id == "default" or not bucket or not record_id:
+            return
+        existing = self.store.get_item("project_memberships", stable_id("PM", project_id, bucket, record_id))
+        if existing and not existing.get("hidden"):
+            return
+        now = utc_now()
+        membership = to_dict(
+            ProjectMembership(
+                membership_id=stable_id("PM", project_id, bucket, record_id),
+                field_id=project_id,
+                bucket=bucket,
+                record_id=record_id,
+                display_order=0,
+                source="cloud_hydrate",
+                hidden=False,
+                created_at=existing.get("created_at") if existing else now,
+                updated_at=now,
+            )
+        )
+        self.store.upsert("project_memberships", membership, "membership_id")
 
     def hydrate_relation(self, record: dict[str, Any], *, snapshot_id: str = "") -> dict[str, Any]:
         relation_id = str(record.get("relation_id") or "")
@@ -143,7 +214,7 @@ class CloudHydrator:
 
     def _hydrate_extraction(self, record: dict[str, Any], saved_work: dict[str, Any], model_key: str) -> None:
         work_id = saved_work.get("work_id") or record.get("work_id")
-        work_version_id = record.get("work_version_id") or saved_work.get("work_version_id")
+        work_version_id = saved_work.get("work_version_id") or record.get("work_version_id")
         if not work_id or not work_version_id:
             return
         run = self.global_store.ensure_extraction_run(
@@ -159,13 +230,44 @@ class CloudHydrator:
         self.global_store.complete_extraction_run(run.get("extraction_run_id") or record.get("extraction_run_id"), result=record.get("result_summary") or record.get("result_refs") or {})
 
     def _origin(self, snapshot_id: str, model_key: str, record: dict[str, Any]) -> dict[str, Any]:
+        resolved_model_key = model_key or self._record_model_key(record)
         return {
             "cloud_snapshot_id": snapshot_id,
             "cloud_record_id": record.get("work_id") or record.get("concept_id") or record.get("record_id") or "",
-            "cloud_model_key": model_key,
+            "cloud_model_key": resolved_model_key,
             "cloud_payload_sha256": record.get("payload_sha256") or "",
             "cloud_updated_at": ((record.get("timestamps") or {}).get("updated_at") or record.get("updated_at") or utc_now()),
         }
+
+    def _record_model_key(self, record: dict[str, Any]) -> str:
+        direct = record.get("model_key")
+        if direct:
+            return str(direct)
+        model_keys = record.get("model_keys")
+        if isinstance(model_keys, list) and model_keys:
+            return str(model_keys[0])
+        runs = record.get("extraction_runs") or record.get("extractions") or []
+        if isinstance(runs, list) and runs:
+            run = runs[0] or {}
+            return build_model_key(
+                str(run.get("llm_provider") or run.get("provider") or ""),
+                str(run.get("llm_model") or run.get("model_name") or ""),
+                str(run.get("model_mode") or "auto"),
+                str(run.get("prompt_version") or ""),
+                str(run.get("schema_version") or "principia-cloud-1.1"),
+                str(run.get("extraction_task_type") or "work_concepts"),
+            )
+        payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+        if payload:
+            return build_model_key(
+                str(payload.get("provider") or payload.get("llm_provider") or ""),
+                str(payload.get("model_name") or payload.get("llm_model") or ""),
+                str(payload.get("model_mode") or "auto"),
+                str(payload.get("prompt_version") or "principia-work-extract-v1"),
+                str(payload.get("schema_version") or "principia-cloud-1.1"),
+                str(payload.get("extraction_task_type") or "work_concepts"),
+            )
+        return ""
 
     def _work_payload(self, record: dict[str, Any], origin: dict[str, Any]) -> dict[str, Any]:
         identity = record.get("identity") or record

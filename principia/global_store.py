@@ -272,45 +272,77 @@ class GlobalStore:
         now = utc_now()
         with self._connect() as conn:
             ensure_v1_schema(conn)
-            conn.execute(
-                """
-                INSERT INTO concept_card(
-                    concept_id, concept_type, canonical_key, canonical_label, source_origin,
-                    validation_level, verification_status, confidence_score, public_scope,
-                    active_version_id, created_at, updated_at
+            confidence = float(payload.get("confidence_score", quality) or quality)
+            existing_by_id = conn.execute("SELECT * FROM concept_card WHERE concept_id = ?", (concept_id,)).fetchone()
+            if existing_by_id:
+                conn.execute(
+                    """
+                    UPDATE concept_card
+                    SET canonical_label = ?,
+                        source_origin = ?,
+                        validation_level = ?,
+                        verification_status = ?,
+                        confidence_score = MAX(confidence_score, ?),
+                        active_version_id = CASE
+                            WHEN ? >= confidence_score THEN ?
+                            ELSE active_version_id
+                        END,
+                        updated_at = ?
+                    WHERE concept_id = ?
+                    """,
+                    (
+                        label,
+                        source_origin,
+                        validation_level,
+                        verification_status,
+                        confidence,
+                        confidence,
+                        version_id,
+                        now,
+                        concept_id,
+                    ),
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(concept_type, canonical_key, public_scope) DO UPDATE SET
-                    canonical_label=excluded.canonical_label,
-                    source_origin=excluded.source_origin,
-                    validation_level=excluded.validation_level,
-                    verification_status=excluded.verification_status,
-                    confidence_score=MAX(concept_card.confidence_score, excluded.confidence_score),
-                    active_version_id=CASE
-                        WHEN excluded.confidence_score >= concept_card.confidence_score THEN excluded.active_version_id
-                        ELSE concept_card.active_version_id
-                    END,
-                    updated_at=excluded.updated_at
-                """,
-                (
-                    concept_id,
-                    concept_type,
-                    canonical_key,
-                    label,
-                    source_origin,
-                    validation_level,
-                    verification_status,
-                    float(payload.get("confidence_score", quality) or quality),
-                    public_scope,
-                    version_id,
-                    now,
-                    now,
-                ),
-            )
-            row = conn.execute(
-                "SELECT concept_id FROM concept_card WHERE concept_type = ? AND canonical_key = ? AND public_scope = ?",
-                (concept_type, canonical_key, public_scope),
-            ).fetchone()
+                row = conn.execute("SELECT concept_id FROM concept_card WHERE concept_id = ?", (concept_id,)).fetchone()
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO concept_card(
+                        concept_id, concept_type, canonical_key, canonical_label, source_origin,
+                        validation_level, verification_status, confidence_score, public_scope,
+                        active_version_id, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(concept_type, canonical_key, public_scope) DO UPDATE SET
+                        canonical_label=excluded.canonical_label,
+                        source_origin=excluded.source_origin,
+                        validation_level=excluded.validation_level,
+                        verification_status=excluded.verification_status,
+                        confidence_score=MAX(concept_card.confidence_score, excluded.confidence_score),
+                        active_version_id=CASE
+                            WHEN excluded.confidence_score >= concept_card.confidence_score THEN excluded.active_version_id
+                            ELSE concept_card.active_version_id
+                        END,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        concept_id,
+                        concept_type,
+                        canonical_key,
+                        label,
+                        source_origin,
+                        validation_level,
+                        verification_status,
+                        confidence,
+                        public_scope,
+                        version_id,
+                        now,
+                        now,
+                    ),
+                )
+                row = conn.execute(
+                    "SELECT concept_id FROM concept_card WHERE concept_type = ? AND canonical_key = ? AND public_scope = ?",
+                    (concept_type, canonical_key, public_scope),
+                ).fetchone()
             concept_id = row["concept_id"]
             existing_active = conn.execute("SELECT active_version_id FROM concept_card WHERE concept_id = ?", (concept_id,)).fetchone()
             active_id = existing_active["active_version_id"] if existing_active else version_id

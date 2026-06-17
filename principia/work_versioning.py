@@ -84,8 +84,10 @@ def cloud_freshness_decision(candidate: dict[str, Any], cloud_work: dict[str, An
     source_state = cloud_work.get("source_state") or {}
     candidate_modified = str(candidate.get("source_modified_at") or candidate.get("source_updated_at") or "")
     cloud_modified = str(source_state.get("source_modified_at") or source_state.get("source_updated_at") or "")
-    if candidate_modified and cloud_modified and candidate_modified > cloud_modified:
-        return {"should_extract": True, "reason": "source_newer_than_cloud"}
+    if candidate_modified and cloud_modified:
+        if candidate_modified > cloud_modified:
+            return {"should_extract": True, "reason": "source_newer_than_cloud"}
+        return {"should_extract": False, "reason": "cloud_cache_hit"}
     sig = work_content_signature(candidate)
     if sig.get("abstract_hash") and source_state.get("abstract_hash") and sig["abstract_hash"] != source_state.get("abstract_hash"):
         return {"should_extract": True, "reason": "abstract_hash_changed"}

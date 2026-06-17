@@ -346,6 +346,10 @@ textarea {
   color: var(--cloud-ink);
 }
 
+.choice-chip.select-all {
+  border-style: dashed;
+}
+
 .checkbox-line {
   gap: 9px;
   color: var(--cloud-muted);
@@ -406,6 +410,20 @@ textarea {
 .candidate-list {
   max-height: 640px;
   overflow: auto;
+}
+
+.queue-add-actions {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) auto auto;
+  gap: 8px;
+  align-items: center;
+  padding: 14px 16px 16px;
+  border-top: 1px solid var(--cloud-line);
+}
+
+.queue-add-actions .more-btn {
+  width: 100%;
+  margin: 0;
 }
 
 .candidate-card {
@@ -473,6 +491,11 @@ textarea {
 .status-researching .queue-status {
   background: var(--cloud-blue-soft);
   color: var(--cloud-blue);
+}
+
+.status-research_task .queue-status {
+  background: var(--cloud-teal-soft);
+  color: var(--cloud-teal);
 }
 
 .status-needs_review .queue-status,
@@ -616,6 +639,14 @@ textarea {
   white-space: nowrap;
 }
 
+.record-actions button.task-added,
+.record-actions button.task-added:disabled {
+  border-color: #c8d0d7;
+  background: #edf1f4;
+  color: #637181;
+  cursor: default;
+}
+
 .benchmark-row-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -671,6 +702,12 @@ textarea {
   display: block;
   margin: 14px auto 0;
   min-width: 148px;
+}
+
+@media (max-width: 760px) {
+  .queue-add-actions {
+    grid-template-columns: 1fr;
+  }
 }
 
 .status-line {
@@ -732,6 +769,23 @@ textarea {
   width: min(920px, calc(100vw - 40px));
   max-height: calc(100vh - 42px);
   overflow: auto;
+}
+
+.model-choice-modal {
+  width: min(520px, calc(100vw - 40px));
+  display: grid;
+  gap: 14px;
+}
+
+.model-choice-modal label {
+  display: grid;
+  gap: 7px;
+}
+
+.model-choice-modal label span {
+  color: var(--cloud-muted);
+  font-size: 12px;
+  font-weight: 820;
 }
 
 .detail-modal header {
@@ -853,6 +907,10 @@ textarea {
 
 .is-loading {
   position: relative;
+}
+
+button.is-loading {
+  padding-right: 36px;
 }
 
 .is-loading::after {

@@ -19,6 +19,11 @@ ALLOWED_NODE_TYPES = {
     "failure_mode",
     "idea_seed",
     "final_idea",
+    "branch",
+    "critique",
+    "pruning_decision",
+    "self_feedback",
+    "synthesis",
 }
 
 ALLOWED_EDGE_TYPES = {
@@ -35,6 +40,13 @@ ALLOWED_EDGE_TYPES = {
     "validates",
     "leads_to",
     "derived_from",
+    "branches_to",
+    "critiques",
+    "prunes",
+    "revises",
+    "merges",
+    "selects",
+    "feedback",
 }
 
 ALLOWED_OPERATORS = {
@@ -48,6 +60,14 @@ ALLOWED_OPERATORS = {
     "mechanism_composition",
     "failure_mode_transplant",
     "evaluator_binding",
+    "branch",
+    "critique",
+    "prune",
+    "revise",
+    "merge",
+    "select",
+    "feedback_loop",
+    "synthesis",
 }
 
 

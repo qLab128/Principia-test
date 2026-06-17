@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
+import sqlite3
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -12,10 +14,17 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .cloud.admin_ops import create_admin_operation, write_admin_operation
-from .cloud.auth import cloud_admin_status, require_admin_key
+from .cloud.auth import (
+    admin_session_status,
+    check_admin_key,
+    clear_admin_session_cookie,
+    cloud_admin_status,
+    create_admin_session_cookie,
+    require_admin_authorization,
+)
 from .cloud.contribution import log_upload_status, prepare_contribution, upload_status
 from .cloud.crawler import plan_crawl
-from .cloud.github_client import maintainer_direct_push
+from .cloud.github_client import maintainer_direct_push, publish_cloud_contribution
 from .cloud.manifest import CloudManifestClient
 from .cloud.resolver import CloudResolver
 from .cloud.search import CloudSearch
@@ -25,6 +34,9 @@ from .llm_client import LLMClient
 from .models import to_dict, utc_now
 from .storage import Store
 from .utils import lexical_score
+
+
+OTHER_FILTER_VALUE = "__other__"
 
 
 def _json_bytes(data: object, status: int = 200) -> tuple[int, bytes, str]:
@@ -37,6 +49,52 @@ def _mask_secret(value: str) -> str:
     if len(value) <= 10:
         return value[:2] + "..." + value[-2:]
     return value[:6] + "..." + value[-4:]
+
+
+def _payload_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    return [value]
+
+
+def _payload_strings(value: Any, *, exclude_other: bool = True) -> list[str]:
+    output: list[str] = []
+    seen: set[str] = set()
+    for item in _payload_list(value):
+        text = str(item or "").strip()
+        if not text:
+            continue
+        if exclude_other and text == OTHER_FILTER_VALUE:
+            continue
+        if text in seen:
+            continue
+        seen.add(text)
+        output.append(text)
+    return output
+
+
+def _payload_ints(value: Any) -> list[int]:
+    output: list[int] = []
+    seen: set[int] = set()
+    for item in _payload_list(value):
+        text = str(item or "").strip()
+        if not text or text == OTHER_FILTER_VALUE:
+            continue
+        try:
+            number = int(text)
+        except Exception:
+            continue
+        if number in seen:
+            continue
+        seen.add(number)
+        output.append(number)
+    return output
+
+
+def _payload_has_other(value: Any) -> bool:
+    return any(str(item or "").strip() == OTHER_FILTER_VALUE for item in _payload_list(value))
 
 
 def _cloud_crawl_goal_text(plan: dict[str, object], payload: dict[str, object]) -> str:
@@ -323,6 +381,8 @@ class PrincipiaRequestHandler(BaseHTTPRequestHandler):
             else:
                 self._send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
                 return
+            if result is None:
+                return
             self._send_json(result)
         except Exception as exc:
             self._send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -335,6 +395,7 @@ class PrincipiaRequestHandler(BaseHTTPRequestHandler):
             goal_text = str(payload.get("goal_text") or payload.get("query") or "")
             model_mode = str(payload.get("model_mode") or "auto")
             target_works = int(payload.get("target_works") or 100)
+            force_refresh = bool(payload.get("force_refresh", False) or payload.get("force", False))
             run_id = f"VRUN-{int(time.time() * 1000)}"
             engine = self.engine
             store = self.store
@@ -365,6 +426,7 @@ class PrincipiaRequestHandler(BaseHTTPRequestHandler):
                         model_mode=model_mode,
                         target_works=target_works,
                         run_id=run_id,
+                        force_refresh=force_refresh,
                     )
                 except Exception:
                     # v2_research_project records the failure in research_runs.
@@ -571,6 +633,25 @@ class PrincipiaRequestHandler(BaseHTTPRequestHandler):
         raise ValueError(f"Unknown v2 endpoint: {path}")
 
     def _handle_v1_post(self, path: str, payload: dict) -> dict:
+        if path == "/api/v1/admin/login":
+            auth = check_admin_key(str(payload.get("admin_key") or ""), purpose="homepage_admin_mode")
+            if not auth.get("ok") or not auth.get("authorized"):
+                self._send_json(
+                    {"error": str(auth.get("error") or auth.get("warning") or "Admin mode is not configured."), "authorization": auth},
+                    HTTPStatus.FORBIDDEN,
+                )
+                return None
+            self._send_json(
+                {**admin_session_status(""), "authenticated": True, "authorization": auth},
+                headers={"Set-Cookie": create_admin_session_cookie()},
+            )
+            return None
+        if path == "/api/v1/admin/logout":
+            self._send_json(
+                {**admin_session_status(""), "authenticated": False},
+                headers={"Set-Cookie": clear_admin_session_cookie()},
+            )
+            return None
         if path.startswith("/api/v1/cloud/"):
             return self._handle_cloud_post(path, payload)
         if path == "/api/v1/research/start":
@@ -578,6 +659,7 @@ class PrincipiaRequestHandler(BaseHTTPRequestHandler):
             goal_text = str(payload.get("goal_text") or payload.get("query") or "")
             model_mode = str(payload.get("model_mode") or "auto")
             target_works = int(payload.get("target_works") or payload.get("paper_count") or 100)
+            force_refresh = bool(payload.get("force_refresh", False) or payload.get("force", False))
             run_id = f"V1RUN-{int(time.time() * 1000)}"
             self.store.upsert(
                 "research_runs",
@@ -607,6 +689,7 @@ class PrincipiaRequestHandler(BaseHTTPRequestHandler):
                         model_mode=model_mode,
                         target_works=target_works,
                         run_id=run_id,
+                        force_refresh=force_refresh,
                     )
                 except Exception as exc:
                     run = self.store.get_item("research_runs", run_id) or {"run_id": run_id}
@@ -934,6 +1017,8 @@ class PrincipiaRequestHandler(BaseHTTPRequestHandler):
             )
         if path == "/api/v1/local-records/cleanup":
             return self.engine.cleanup_local_records()
+        if path == "/api/v1/local-records/compact":
+            return self.engine.compact_local_storage(clear_cloud_cache=bool(payload.get("clear_cloud_cache", True)))
         if path == "/api/v1/local-records/clear":
             return self.engine.clear_local_records(include_projects=bool(payload.get("include_projects")))
         if path == "/api/v1/project/reorder":
@@ -1129,6 +1214,7 @@ class PrincipiaRequestHandler(BaseHTTPRequestHandler):
                     params.get("id", [""])[0],
                     version=params.get("version", [""])[0],
                     model_mode=model_mode,
+                    field_id=field_id,
                 )
             )
             return
@@ -1321,6 +1407,9 @@ class PrincipiaRequestHandler(BaseHTTPRequestHandler):
     def _handle_v1_get(self, path: str, params: dict[str, list[str]]) -> None:
         field_id = params.get("field_id", ["default"])[0]
         query = params.get("query", [""])[0]
+        if path == "/api/v1/admin/session":
+            self._send_json(admin_session_status(self.headers.get("Cookie", "")))
+            return
         if path.startswith("/api/v1/cloud"):
             self._handle_cloud_get(path, params)
             return
@@ -1360,6 +1449,7 @@ class PrincipiaRequestHandler(BaseHTTPRequestHandler):
                     params.get("id", [""])[0],
                     version=params.get("version", [""])[0],
                     model_mode=params.get("model_mode", ["auto"])[0] or "auto",
+                    field_id=field_id,
                 )
             )
             return
@@ -1446,7 +1536,8 @@ class PrincipiaRequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/v1/cloud/local/summary":
             field_id = params.get("field_id", ["cloud-crawl"])[0] or "cloud-crawl"
-            self._send_json({"field_id": field_id, "counts": self.engine.cloud_local_counts(field_id)})
+            model_mode = params.get("model_mode", ["auto"])[0] or "auto"
+            self._send_json({"field_id": field_id, "counts": self.engine.cloud_local_counts(field_id, model_mode=model_mode)})
             return
         if path == "/api/v1/cloud/local/tab":
             field_id = params.get("field_id", ["cloud-crawl"])[0] or "cloud-crawl"
@@ -1459,6 +1550,7 @@ class PrincipiaRequestHandler(BaseHTTPRequestHandler):
                     query=params.get("query", [""])[0],
                     model_mode=params.get("model_mode", ["auto"])[0] or "auto",
                     sync_state=params.get("sync_state", ["unsynced"])[0] or "unsynced",
+                    include_counts=params.get("include_counts", ["1"])[0].lower() not in {"0", "false", "no"},
                 )
             )
             return
@@ -1501,15 +1593,27 @@ class PrincipiaRequestHandler(BaseHTTPRequestHandler):
             }
         if path == "/api/v1/cloud/prefetch" or path == "/api/v1/cloud/search":
             search_model_mode = str(payload.get("model_mode") or "")
+            limit = int(payload.get("limit") or 20)
+            offset = int(payload.get("offset") or 0)
+            raw_venues = _payload_list(payload.get("venues"))
+            raw_years = _payload_list(payload.get("years"))
+            venues = _payload_strings(raw_venues)
+            years = _payload_ints(raw_years)
+            venue_other = bool(payload.get("venue_other")) or _payload_has_other(raw_venues)
+            year_other = bool(payload.get("year_other")) or _payload_has_other(raw_years)
             return CloudSearch(resolver).search(
                 str(payload.get("query") or ""),
-                limit=int(payload.get("limit") or 20),
-                offset=int(payload.get("offset") or 0),
+                limit=limit,
+                offset=offset,
                 model_key=str(payload.get("model_key") or (self.engine._cloud_model_key(search_model_mode) if search_model_mode else "")),
                 venue=str(payload.get("venue") or ""),
-                venues=[str(item) for item in (payload.get("venues") or []) if str(item).strip()],
-                year=int(payload["year"]) if str(payload.get("year") or "").strip() else None,
-                years=[int(item) for item in (payload.get("years") or []) if str(item).strip()],
+                venues=venues,
+                venue_other=venue_other,
+                known_venues=_payload_strings(payload.get("known_venues")),
+                year=(_payload_ints(payload.get("year")) or [None])[0],
+                years=years,
+                year_other=year_other,
+                known_years=_payload_ints(payload.get("known_years")),
                 source_type=str(payload.get("source_type") or ""),
                 concept_type=str(payload.get("concept_type") or ""),
             )
@@ -1526,8 +1630,10 @@ class PrincipiaRequestHandler(BaseHTTPRequestHandler):
             record_id = str(payload.get("id") or payload.get("record_id") or "")
             field_id = str(payload.get("field_id") or "default")
             model_mode = str(payload.get("model_mode") or "auto")
+            item: dict[str, Any] = {}
             if bucket == "source_works":
                 work_ids = [record_id]
+                item = self.store.get_item(bucket, record_id) or {}
             else:
                 item = self.store.get_item(bucket, record_id)
                 if not item:
@@ -1535,6 +1641,19 @@ class PrincipiaRequestHandler(BaseHTTPRequestHandler):
                 work_ids = self.engine._cloud_record_work_ids(bucket, item)
             if not work_ids:
                 raise ValueError("No source work IDs are available for this record.")
+            item_scoped_quality = self._cloud_record_upload_quality(bucket, item)
+            item_scoped_upload = bucket in {"benchmark_records", "baseline_records"}
+            if item_scoped_upload and not item_scoped_quality.get("ok"):
+                return {
+                    "ok": False,
+                    "local_work_ids": work_ids,
+                    "record_upload_quality": item_scoped_quality,
+                    "cloud_publish": {
+                        "ok": False,
+                        "available_for_search": False,
+                        "message": "This benchmark/baseline did not pass item-level cloud upload quality checks.",
+                    },
+                }
             sync_source = self.engine.sync_cloud_legacy_records_for_upload(
                 work_ids,
                 field_id=field_id,
@@ -1549,39 +1668,83 @@ class PrincipiaRequestHandler(BaseHTTPRequestHandler):
                 created_by=dict(payload.get("created_by") or {}),
                 upload_mode=str(payload.get("upload_mode") or "normal"),
                 admin_key=str(payload.get("admin_key") or ""),
-                require_complete_extraction=True,
+                require_complete_extraction=not item_scoped_upload,
             )
+            prepared["record_upload_quality"] = item_scoped_quality
             if not prepared.get("ok"):
+                decisions = [dict(item) for item in (prepared.get("upload_decisions") or []) if isinstance(item, dict)]
+                cache_decisions = [
+                    item
+                    for item in decisions
+                    if str(item.get("cloud_decision") or "") in {"cloud_cache_hit", "source_unchanged"}
+                ]
+                hard_rejections = [
+                    item
+                    for item in decisions
+                    if not bool(item.get("upload_allowed")) and str(item.get("cloud_decision") or "") not in {"cloud_cache_hit", "source_unchanged"}
+                ]
+                if cache_decisions and not hard_rejections:
+                    export_to_local = {str(export_id): str(local_id) for local_id, export_id in dict(sync_source.get("work_id_map") or {}).items()}
+                    cached_local_ids = self.engine._ordered_unique(
+                        [
+                            export_to_local.get(str(item.get("work_id") or ""), str(item.get("work_id") or ""))
+                            for item in cache_decisions
+                            if str(item.get("work_id") or "")
+                        ]
+                    )
+                    sync_result = self.engine.mark_cloud_synced(
+                        cached_local_ids or work_ids,
+                        field_id=field_id,
+                        contribution_path=str(prepared.get("path") or ""),
+                        upload_id="",
+                        status="synced",
+                        model_mode=model_mode,
+                    )
+                    return {
+                        "ok": True,
+                        "already_in_cloud": True,
+                        "prepared": prepared,
+                        "local_work_ids": work_ids,
+                        "export_work_ids": export_work_ids,
+                        "cloud_publish": {
+                            "ok": True,
+                            "available_for_search": True,
+                            "message": "This paper/model version is already in the searchable cloud snapshot and was marked synced locally.",
+                        },
+                        "sync_result": sync_result,
+                    }
                 return {"ok": False, "prepared": prepared, "local_work_ids": work_ids, "export_work_ids": export_work_ids}
             contribution_path = str(prepared.get("path") or "")
-            auth = require_admin_key(str(payload.get("admin_key") or ""), purpose="cloud_upload_record_submit")
-            direct_push = maintainer_direct_push(
+            auth = require_admin_authorization(str(payload.get("admin_key") or ""), cookie_header=self.headers.get("Cookie", ""), purpose="cloud_upload_record_submit")
+            remote = str(payload.get("remote") or "origin")
+            base_branch = str(payload.get("base_branch") or "main")
+            target_branch = str(payload.get("branch") or os.getenv("PRINCIPIA_CLOUD_UPLOAD_BRANCH") or "")
+            background = self._start_cloud_publish_job(
                 contribution_path,
-                ROOT_DIR,
-                branch=str(payload.get("branch") or ""),
-                remote=str(payload.get("remote") or "origin"),
-                base_branch=str(payload.get("base_branch") or "main"),
-                push=not bool(payload.get("dry_run", False)),
-            )
-            upload_state = "submitted" if direct_push.get("ok") and direct_push.get("pushed") else "prepared"
-            if not direct_push.get("ok"):
-                upload_state = "error"
-            status = log_upload_status(
-                self.store.path,
-                contribution_path=contribution_path,
-                status=upload_state,
+                local_work_ids=work_ids,
+                field_id=field_id,
+                model_mode=model_mode,
                 upload_mode=str(payload.get("upload_mode") or "normal"),
+                branch=target_branch,
+                remote=remote,
+                base_branch=base_branch,
+                dry_run=bool(payload.get("dry_run", False)),
             )
-            sync_result = {}
-            if upload_state == "submitted":
-                sync_result = self.engine.mark_cloud_synced(
-                    self.engine._ordered_unique([*work_ids, *self._work_ids_from_contribution(contribution_path)]),
-                    field_id=field_id,
-                    contribution_path=contribution_path,
-                    upload_id=str(status.get("upload_id") or ""),
-                    status="synced",
-                )
-            return {"ok": upload_state == "submitted", "prepared": prepared, "local_work_ids": work_ids, "export_work_ids": export_work_ids, **status, "authorization": auth, "direct_push": direct_push, "sync_result": sync_result}
+            return {
+                "ok": True,
+                "accepted": True,
+                "prepared": prepared,
+                "local_work_ids": work_ids,
+                "export_work_ids": export_work_ids,
+                "authorization": auth,
+                **background,
+                "cloud_publish": {
+                    "ok": False,
+                    "available_for_search": False,
+                    "background": True,
+                    "message": "Contribution accepted. Cloud publication is running in the background.",
+                },
+            }
         if path == "/api/v1/cloud/upload/prepare":
             upload_model_mode = str(payload.get("model_mode") or "auto")
             local_work_ids = [str(item) for item in (payload.get("work_ids") or []) if str(item).strip()]
@@ -1601,19 +1764,52 @@ class PrincipiaRequestHandler(BaseHTTPRequestHandler):
                 admin_key=str(payload.get("admin_key") or ""),
                 require_complete_extraction=True,
             )
-            return {**prepared, "local_work_ids": local_work_ids, "export_work_ids": export_work_ids, "legacy_sync": sync_source}
+            work_id_map = dict(sync_source.get("work_id_map") or {})
+            allowed_export_ids = {str(item) for item in (prepared.get("allowed_work_ids") or [])}
+            allowed_local_work_ids = [
+                local_id
+                for local_id, export_id in work_id_map.items()
+                if str(export_id) in allowed_export_ids
+            ]
+            if not allowed_local_work_ids:
+                allowed_local_work_ids = [work_id for work_id in local_work_ids if work_id in allowed_export_ids]
+            return {
+                **prepared,
+                "local_work_ids": local_work_ids,
+                "allowed_local_work_ids": allowed_local_work_ids,
+                "export_work_ids": export_work_ids,
+                "legacy_sync": sync_source,
+            }
         if path == "/api/v1/cloud/upload/submit":
             contribution_path = str(payload.get("contribution_path") or payload.get("path") or "")
-            auth = require_admin_key(str(payload.get("admin_key") or ""), purpose="cloud_upload_submit")
+            auth = require_admin_authorization(str(payload.get("admin_key") or ""), cookie_header=self.headers.get("Cookie", ""), purpose="cloud_upload_submit")
+            remote = str(payload.get("remote") or "origin")
+            base_branch = str(payload.get("base_branch") or "main")
+            target_branch = str(payload.get("branch") or os.getenv("PRINCIPIA_CLOUD_UPLOAD_BRANCH") or "")
             direct_push = maintainer_direct_push(
                 contribution_path,
                 ROOT_DIR,
-                branch=str(payload.get("branch") or ""),
-                remote=str(payload.get("remote") or "origin"),
-                base_branch=str(payload.get("base_branch") or "main"),
+                branch=target_branch,
+                remote=remote,
+                base_branch=base_branch,
                 push=not bool(payload.get("dry_run", False)),
             )
-            upload_state = "submitted" if direct_push.get("ok") and direct_push.get("pushed") else "prepared"
+            direct_submitted = bool(direct_push.get("ok") and (direct_push.get("pushed") or "already exists" in str(direct_push.get("message") or "").lower()))
+            cloud_publish = (
+                publish_cloud_contribution(
+                    contribution_path,
+                    ROOT_DIR,
+                    direct_push=direct_push,
+                    branch=target_branch,
+                    remote=remote,
+                    base_branch=base_branch,
+                    trigger_workflow=not bool(payload.get("dry_run", False)),
+                    local_snapshot=not bool(payload.get("dry_run", False)),
+                )
+                if direct_submitted
+                else {}
+            )
+            upload_state = "published" if cloud_publish.get("ok") and cloud_publish.get("available_for_search") else ("submitted" if direct_submitted else "prepared")
             if not direct_push.get("ok"):
                 upload_state = "error"
             status = log_upload_status(
@@ -1623,28 +1819,89 @@ class PrincipiaRequestHandler(BaseHTTPRequestHandler):
                 upload_mode=str(payload.get("upload_mode") or "normal"),
             )
             sync_result = {}
-            if upload_state == "submitted":
-                local_work_ids = [str(item) for item in (payload.get("work_ids") or payload.get("local_work_ids") or []) if str(item).strip()]
+            if upload_state == "published":
+                local_work_ids = [str(item) for item in (payload.get("local_work_ids") or payload.get("work_ids") or []) if str(item).strip()]
                 sync_result = self.engine.mark_cloud_synced(
                     self.engine._ordered_unique([*local_work_ids, *self._work_ids_from_contribution(contribution_path)]),
                     field_id=str(payload.get("field_id") or "cloud-crawl"),
                     contribution_path=contribution_path,
                     upload_id=str(status.get("upload_id") or ""),
                     status="synced",
+                    model_mode=str(payload.get("model_mode") or "auto"),
                 )
-            return {**status, "authorization": auth, "direct_push": direct_push, "sync_result": sync_result}
+            return {**status, "ok": upload_state == "published", "authorization": auth, "direct_push": direct_push, "cloud_publish": cloud_publish, "sync_result": sync_result}
+        if path == "/api/v1/cloud/local/queue/add":
+            return self.engine.queue_cloud_candidates(
+                [dict(item) for item in (payload.get("candidates") or []) if isinstance(item, dict)],
+                field_id=str(payload.get("field_id") or "cloud-crawl"),
+                model_mode=str(payload.get("model_mode") or "auto"),
+                recover_abstracts=bool(payload.get("recover_abstracts")),
+                include_tab=payload.get("include_tab", True) is not False,
+                include_counts=payload.get("include_counts", True) is not False,
+            )
+        if path == "/api/v1/cloud/local/queue/remove":
+            return self.engine.remove_cloud_queue(
+                [str(item) for item in (payload.get("work_ids") or []) if str(item).strip()],
+                field_id=str(payload.get("field_id") or "cloud-crawl"),
+                model_mode=str(payload.get("model_mode") or "auto"),
+            )
+        if path == "/api/v1/cloud/local/queue/clear":
+            auth = require_admin_authorization(str(payload.get("admin_key") or ""), cookie_header=self.headers.get("Cookie", ""), purpose="cloud_queue_clear")
+            result = self.engine.clear_cloud_queue(str(payload.get("field_id") or "cloud-crawl"))
+            return {**result, "authorization": auth}
+        if path == "/api/v1/cloud/local/tasks/add":
+            return self.engine.add_cloud_research_tasks(
+                [str(item) for item in (payload.get("work_ids") or []) if str(item).strip()],
+                field_id=str(payload.get("field_id") or "cloud-crawl"),
+                model_mode=str(payload.get("model_mode") or "auto"),
+                include_tab=payload.get("include_tab", True) is not False,
+                include_counts=payload.get("include_counts", True) is not False,
+            )
+        if path == "/api/v1/cloud/local/tasks/add-all":
+            return self.engine.add_all_cloud_research_tasks(
+                field_id=str(payload.get("field_id") or "cloud-crawl"),
+                model_mode=str(payload.get("model_mode") or "all"),
+                limit=int(payload.get("limit") or 10000),
+                include_tab=payload.get("include_tab", False) is True,
+                include_counts=payload.get("include_counts", False) is True,
+            )
+        if path == "/api/v1/cloud/local/tasks/remove":
+            return self.engine.remove_cloud_research_tasks(
+                [str(item) for item in (payload.get("work_ids") or []) if str(item).strip()],
+                field_id=str(payload.get("field_id") or "cloud-crawl"),
+                model_mode=str(payload.get("model_mode") or "auto"),
+            )
+        if path == "/api/v1/cloud/local/tasks/clear":
+            auth = require_admin_authorization(str(payload.get("admin_key") or ""), cookie_header=self.headers.get("Cookie", ""), purpose="cloud_tasks_clear")
+            result = self.engine.clear_cloud_research_tasks(
+                str(payload.get("field_id") or "cloud-crawl"),
+                model_mode=str(payload.get("model_mode") or "auto"),
+            )
+            return {**result, "authorization": auth}
         if path == "/api/v1/cloud/admin/crawl/plan" or path == "/api/v1/cloud/admin/crawl/run":
-            auth = require_admin_key(str(payload.get("admin_key") or ""), purpose="cloud_crawl") if path.endswith("/run") else cloud_admin_status()
+            auth = require_admin_authorization(str(payload.get("admin_key") or ""), cookie_header=self.headers.get("Cookie", ""), purpose="cloud_crawl") if path.endswith("/run") else cloud_admin_status()
             model_mode = str(payload.get("model_mode") or payload.get("model_key") or "auto")
             provided_candidates = [dict(item) for item in (payload.get("candidates") or []) if isinstance(item, dict)]
             max_papers = int(payload.get("max_papers") or 100)
+            raw_venues = _payload_list(payload.get("venues"))
+            raw_years = _payload_list(payload.get("years"))
+            venues = _payload_strings(raw_venues)
+            years = _payload_ints(raw_years)
+            venue_other = bool(payload.get("venue_other")) or _payload_has_other(raw_venues)
+            year_other = bool(payload.get("year_other")) or _payload_has_other(raw_years)
+            known_venues = _payload_strings(payload.get("known_venues"))
+            known_years = _payload_ints(payload.get("known_years"))
             if provided_candidates and path.endswith("/run"):
                 plan = {
                     "plan_id": f"CRAWL-SELECTED-{int(time.time() * 1000)}",
                     "created_at": utc_now(),
                     "dry_run": False,
-                    "venues": list(payload.get("venues") or []),
-                    "years": [int(item) for item in (payload.get("years") or [])],
+                    "venues": venues,
+                    "venue_other": venue_other,
+                    "known_venues": known_venues,
+                    "years": years,
+                    "year_other": year_other,
+                    "known_years": known_years,
                     "topics": list(payload.get("topics") or []),
                     "priority_rules": list(payload.get("priority_rules") or []),
                     "model_key": str(payload.get("model_key") or self.engine._cloud_model_key(model_mode)),
@@ -1658,8 +1915,12 @@ class PrincipiaRequestHandler(BaseHTTPRequestHandler):
                 }
             else:
                 plan = plan_crawl(
-                    venues=list(payload.get("venues") or []),
-                    years=[int(item) for item in (payload.get("years") or [])],
+                    venues=venues,
+                    venue_other=venue_other,
+                    known_venues=known_venues,
+                    years=years,
+                    year_other=year_other,
+                    known_years=known_years,
                     topics=list(payload.get("topics") or []),
                     priority_rules=list(payload.get("priority_rules") or []),
                     max_papers=max_papers,
@@ -1681,17 +1942,18 @@ class PrincipiaRequestHandler(BaseHTTPRequestHandler):
                 return {**plan, "authorization": auth, "operation": operation, "path": str(out_path), **run}
             return {**plan, "authorization": auth}
         if path == "/api/v1/cloud/local/cleanup":
-            auth = require_admin_key(str(payload.get("admin_key") or ""), purpose="cloud_local_cleanup")
+            auth = require_admin_authorization(str(payload.get("admin_key") or ""), cookie_header=self.headers.get("Cookie", ""), purpose="cloud_local_cleanup")
             result = self.engine.clear_cloud_synced_cache(str(payload.get("field_id") or "cloud-crawl"))
             return {**result, "authorization": auth}
         if path == "/api/v1/cloud/local/mark-synced":
-            auth = require_admin_key(str(payload.get("admin_key") or ""), purpose="cloud_local_mark_synced")
+            auth = require_admin_authorization(str(payload.get("admin_key") or ""), cookie_header=self.headers.get("Cookie", ""), purpose="cloud_local_mark_synced")
             result = self.engine.mark_cloud_synced(
                 [str(item) for item in (payload.get("work_ids") or []) if str(item).strip()],
                 field_id=str(payload.get("field_id") or "cloud-crawl"),
                 contribution_path=str(payload.get("contribution_path") or ""),
                 upload_id=str(payload.get("upload_id") or ""),
                 status=str(payload.get("status") or "synced"),
+                model_mode=str(payload.get("model_mode") or "auto"),
             )
             return {**result, "authorization": auth}
         if path in {
@@ -1700,7 +1962,7 @@ class PrincipiaRequestHandler(BaseHTTPRequestHandler):
             "/api/v1/cloud/admin/merge-concepts",
             "/api/v1/cloud/admin/split-concept",
         }:
-            auth = require_admin_key(str(payload.get("admin_key") or ""), purpose="cloud_admin_operation")
+            auth = require_admin_authorization(str(payload.get("admin_key") or ""), cookie_header=self.headers.get("Cookie", ""), purpose="cloud_admin_operation")
             op_type = path.rsplit("/", 1)[-1].replace("-", "_")
             operation = create_admin_operation(
                 op_type,
@@ -1722,6 +1984,7 @@ class PrincipiaRequestHandler(BaseHTTPRequestHandler):
         model_mode = str(payload.get("model_mode") or payload.get("model_key") or "auto").strip() or "auto"
         goal_text = _cloud_crawl_goal_text(plan, payload)
         model = self.engine._v2_model_meta(model_mode)
+        parallelism = max(1, min(int(payload.get("parallelism") or os.getenv("PRINCIPIA_CLOUD_RESEARCH_PARALLELISM") or 4), 8))
         self.engine._cancelled_runs.discard(run_id)
         self.engine._ensure_field_profile(field_id, goal_text)
         run = {
@@ -1738,7 +2001,17 @@ class PrincipiaRequestHandler(BaseHTTPRequestHandler):
             "target_works": len(candidates),
             "plan_id": plan.get("plan_id", ""),
             "operation_path": operation_path,
-            "counts": {"planned": len(candidates), "stored_works": 0, "extracted_works": 0, "cloud_hits": 0, "failed_works": 0},
+            "counts": {
+                "planned": len(candidates),
+                "stored_works": 0,
+                "extracted_works": 0,
+                "cloud_hits": 0,
+                "failed_works": 0,
+                "ready_works": 0,
+                "needs_review_works": 0,
+                "active_works": 0,
+                "parallelism": parallelism,
+            },
             "errors": [],
             "warnings": list(plan.get("metadata_warnings") or []),
             "started_at": utc_now(),
@@ -1747,7 +2020,7 @@ class PrincipiaRequestHandler(BaseHTTPRequestHandler):
         self.store.upsert("research_runs", run, "run_id")
         threading.Thread(
             target=self._run_cloud_crawl_job,
-            args=(run_id, field_id, goal_text, model_mode, candidates, bool(payload.get("force", False))),
+            args=(run_id, field_id, goal_text, model_mode, candidates, bool(payload.get("force", False)), parallelism),
             name=f"principia-cloud-crawl-{run_id}",
             daemon=True,
         ).start()
@@ -1761,33 +2034,155 @@ class PrincipiaRequestHandler(BaseHTTPRequestHandler):
         model_mode: str,
         candidates: list[dict[str, Any]],
         force: bool,
+        parallelism: int = 4,
     ) -> None:
         work_ids: list[str] = []
         errors: list[str] = []
         warnings: list[str] = []
-        counts = {"planned": len(candidates), "stored_works": 0, "extracted_works": 0, "cloud_hits": 0, "skipped_works": 0, "failed_works": 0}
+        counts = {
+            "planned": len(candidates),
+            "stored_works": 0,
+            "extracted_works": 0,
+            "cloud_hits": 0,
+            "skipped_works": 0,
+            "failed_works": 0,
+            "ready_works": 0,
+            "needs_review_works": 0,
+            "active_works": 0,
+            "parallelism": max(1, min(int(parallelism or 4), 8)),
+        }
+        progress_lock = threading.RLock()
+        active_work_ids: dict[str, int] = {}
+        processed_works = 0
 
         def update(stage: str, message: str, **extra: Any) -> dict[str, Any]:
-            run = self.store.get_item("research_runs", run_id) or {"run_id": run_id}
-            merged = {**counts, **dict(run.get("counts") or {}), **{key: value for key, value in extra.items() if value is not None}}
-            run.update(
-                {
-                    "status": "running" if stage not in {"complete", "error", "cancelled"} else stage,
-                    "stage": stage,
-                    "message": message,
-                    "counts": merged,
-                    "errors": errors[:20],
-                    "warnings": self.engine._ordered_unique([*list(run.get("warnings") or []), *warnings])[:20],
-                    "updated_at": utc_now(),
-                }
+            with progress_lock:
+                run = self.store.get_item("research_runs", run_id) or {"run_id": run_id}
+                merged = {**dict(run.get("counts") or {}), **counts, **{key: value for key, value in extra.items() if value is not None}}
+                run.update(
+                    {
+                        "status": "running" if stage not in {"complete", "error", "cancelled"} else stage,
+                        "stage": stage,
+                        "message": message,
+                        "counts": merged,
+                        "errors": errors[:20],
+                        "warnings": self.engine._ordered_unique([*list(run.get("warnings") or []), *warnings])[:20],
+                        "updated_at": utc_now(),
+                    }
+                )
+                self.store.upsert("research_runs", run, "run_id")
+                return run
+
+        def process_work(idx: int, work_id: str) -> dict[str, Any]:
+            worker_engine = PrincipiaEngine(store=self.store)
+            self.engine._raise_if_cancelled(run_id)
+            work = self.store.get_item("source_works", work_id) or {}
+            with progress_lock:
+                active_work_ids[work_id] = idx
+                counts["active_works"] = len(active_work_ids)
+                update(
+                    "llm_extraction",
+                    f"Researching {len(active_work_ids)} paper(s) in parallel.",
+                    current_work_id=work_id,
+                    current_index=idx,
+                    active_work_ids=list(active_work_ids),
+                    active_works=len(active_work_ids),
+                    processed_works=processed_works,
+                )
+            self.engine._set_cloud_work_research_state(
+                work_id,
+                "researching",
+                model_mode=model_mode,
+                run_id=run_id,
+                message=f"Researching {idx}/{len(work_ids)}.",
+                extra={"cloud_research_index": idx, "cloud_research_total": len(work_ids)},
             )
-            self.store.upsert("research_runs", run, "run_id")
-            return run
+            self.engine._set_cloud_work_task_state(
+                work_id,
+                "researching",
+                model_mode=model_mode,
+                run_id=run_id,
+                message=f"Researching {idx}/{len(work_ids)}.",
+            )
+            try:
+                result = worker_engine.v2_extract_single_work(
+                    work_id,
+                    field_id=field_id,
+                    goal_text=goal_text,
+                    model_mode=model_mode,
+                    run_id=run_id,
+                    force=force,
+                )
+                if result.get("cloud_cache_hit"):
+                    outcome = "cloud_hits"
+                elif result.get("already_extracted"):
+                    outcome = "skipped_works"
+                else:
+                    outcome = "extracted_works"
+                status = self.engine.cloud_work_research_status(work_id, field_id=field_id, model_mode=model_mode)
+                if status.get("ready_to_sync"):
+                    state = "ready"
+                    message = "Extraction complete and ready to sync."
+                elif result.get("cloud_cache_hit"):
+                    state = "ready" if not status.get("missing_required") else "needs_review"
+                    message = "Loaded from cloud cache." if state == "ready" else "Cloud cache hit is missing required local records."
+                elif result.get("already_extracted"):
+                    state = "ready" if not status.get("missing_required") else "needs_review"
+                    message = "Already extracted locally." if state == "ready" else "Existing extraction is missing required records."
+                else:
+                    state = "needs_review"
+                    message = "Extraction finished but required records are incomplete."
+                self.engine._set_cloud_work_research_state(
+                    work_id,
+                    state,
+                    model_mode=model_mode,
+                    run_id=run_id,
+                    message=message,
+                    extra={
+                        "cloud_required_missing": status.get("missing_required", []),
+                        "cloud_required_counts": status.get("required_counts", {}),
+                    },
+                )
+                self.engine._set_cloud_work_task_state(
+                    work_id,
+                    "done" if state == "ready" else state,
+                    model_mode=model_mode,
+                    run_id=run_id,
+                    message=message,
+                )
+                return {"work_id": work_id, "outcome": outcome, "state": state, "message": message}
+            except CancelledRun:
+                raise
+            except Exception as exc:
+                self.engine._set_cloud_work_research_state(
+                    work_id,
+                    "failed",
+                    model_mode=model_mode,
+                    run_id=run_id,
+                    message=self.engine._friendly_llm_error(exc),
+                )
+                self.engine._set_cloud_work_task_state(
+                    work_id,
+                    "failed",
+                    model_mode=model_mode,
+                    run_id=run_id,
+                    message=self.engine._friendly_llm_error(exc),
+                )
+                return {"work_id": work_id, "outcome": "failed_works", "state": "failed", "error": f"{work_id}: {exc}"}
+            finally:
+                with progress_lock:
+                    active_work_ids.pop(work_id, None)
+                    counts["active_works"] = len(active_work_ids)
 
         try:
             update("metadata_store", "Storing public metadata candidates from the crawler plan.")
+            candidates = self.engine._recover_candidate_abstracts([dict(item) for item in candidates])
             for candidate in candidates:
                 self.engine._raise_if_cancelled(run_id)
+                candidate = dict(candidate)
+                selected_work_id = str(candidate.get("work_id") or "")
+                if selected_work_id and self.store.get_item("source_works", selected_work_id):
+                    candidate["preserve_work_id"] = True
                 candidate.setdefault("cloud_local_origin", "cloud_crawl")
                 candidate.setdefault("cloud_sync_status", "unsynced")
                 candidate.setdefault("cloud_research_state", "queued")
@@ -1795,9 +2190,25 @@ class PrincipiaRequestHandler(BaseHTTPRequestHandler):
                 candidate.setdefault("cloud_research_message", "Queued for cloud-page research.")
                 work = self.engine._v2_upsert_work(candidate, model_mode="metadata")
                 work_ids.append(work["work_id"])
+                if self.engine._cloud_generic_queue_state(work) != "removed":
+                    self.engine._set_cloud_work_research_state(
+                        work["work_id"],
+                        "queued",
+                        model_mode="all",
+                        run_id=run_id,
+                        message="Queued for cloud-page research.",
+                    )
+                self.engine._set_cloud_work_task_state(
+                    work["work_id"],
+                    "research_task",
+                    model_mode=model_mode,
+                    run_id=run_id,
+                    message="Prepared for cloud-page research.",
+                )
                 self.engine._set_cloud_work_research_state(
                     work["work_id"],
                     "queued",
+                    model_mode=model_mode,
                     run_id=run_id,
                     message="Queued for cloud-page research.",
                 )
@@ -1810,6 +2221,14 @@ class PrincipiaRequestHandler(BaseHTTPRequestHandler):
                     self.engine._set_cloud_work_research_state(
                         work_id,
                         "metadata_only",
+                        model_mode=model_mode,
+                        run_id=run_id,
+                        message="Metadata saved. Configure an LLM before extraction.",
+                    )
+                    self.engine._set_cloud_work_task_state(
+                        work_id,
+                        "metadata_only",
+                        model_mode=model_mode,
                         run_id=run_id,
                         message="Metadata saved. Configure an LLM before extraction.",
                     )
@@ -1817,72 +2236,41 @@ class PrincipiaRequestHandler(BaseHTTPRequestHandler):
                 run["completed_at"] = utc_now()
                 self.store.upsert("research_runs", run, "run_id")
                 return
-            for idx, work_id in enumerate(work_ids, start=1):
-                self.engine._raise_if_cancelled(run_id)
-                work = self.store.get_item("source_works", work_id) or {}
-                update(
-                    "llm_extraction",
-                    f"Extracting crawler work {idx}/{len(work_ids)}: {work.get('title') or work_id}",
-                    current_work_id=work_id,
-                    current_index=idx,
-                )
-                self.engine._set_cloud_work_research_state(
-                    work_id,
-                    "researching",
-                    run_id=run_id,
-                    message=f"Researching {idx}/{len(work_ids)}.",
-                    extra={"cloud_research_index": idx, "cloud_research_total": len(work_ids)},
-                )
-                try:
-                    result = self.engine.v2_extract_single_work(
-                        work_id,
-                        field_id=field_id,
-                        goal_text=goal_text,
-                        model_mode=model_mode,
-                        run_id=run_id,
-                        force=force,
-                    )
-                    if result.get("cloud_cache_hit"):
-                        counts["cloud_hits"] += 1
-                    elif result.get("already_extracted"):
-                        counts["skipped_works"] += 1
-                    else:
-                        counts["extracted_works"] += 1
-                    status = self.engine.cloud_work_research_status(work_id, field_id=field_id)
-                    if status.get("ready_to_sync"):
-                        state = "ready"
-                        message = "Extraction complete and ready to sync."
-                    elif result.get("cloud_cache_hit"):
-                        state = "ready" if not status.get("missing_required") else "needs_review"
-                        message = "Loaded from cloud cache." if state == "ready" else "Cloud cache hit is missing required local records."
-                    elif result.get("already_extracted"):
-                        state = "ready" if not status.get("missing_required") else "needs_review"
-                        message = "Already extracted locally." if state == "ready" else "Existing extraction is missing required records."
-                    else:
-                        state = "needs_review"
-                        message = "Extraction finished but required records are incomplete."
-                    self.engine._set_cloud_work_research_state(
-                        work_id,
-                        state,
-                        run_id=run_id,
-                        message=message,
-                        extra={
-                            "cloud_required_missing": status.get("missing_required", []),
-                            "cloud_required_counts": status.get("required_counts", {}),
-                        },
-                    )
-                except CancelledRun:
-                    raise
-                except Exception as exc:
-                    counts["failed_works"] += 1
-                    errors.append(f"{work_id}: {exc}")
-                    self.engine._set_cloud_work_research_state(
-                        work_id,
-                        "failed",
-                        run_id=run_id,
-                        message=self.engine._friendly_llm_error(exc),
-                    )
-                update("llm_extraction", f"Processed {idx}/{len(work_ids)} crawler work candidate(s).")
+            max_workers = max(1, min(counts["parallelism"], len(work_ids)))
+            update("llm_extraction", f"Starting cloud research with {max_workers} parallel API worker(s).", active_works=0, processed_works=0)
+            executor = ThreadPoolExecutor(max_workers=max_workers)
+            futures = {executor.submit(process_work, idx, work_id): (idx, work_id) for idx, work_id in enumerate(work_ids, start=1)}
+            try:
+                for future in as_completed(futures):
+                    self.engine._raise_if_cancelled(run_id)
+                    result = future.result()
+                    with progress_lock:
+                        processed_works += 1
+                        outcome = str(result.get("outcome") or "")
+                        if outcome in counts:
+                            counts[outcome] += 1
+                        if result.get("state") == "ready":
+                            counts["ready_works"] += 1
+                        elif result.get("state") == "needs_review":
+                            counts["needs_review_works"] += 1
+                        if result.get("error"):
+                            errors.append(str(result.get("error")))
+                        next_index = min(len(work_ids), processed_works + len(active_work_ids) + 1)
+                        update(
+                            "llm_extraction",
+                            f"Processed {processed_works}/{len(work_ids)} crawler work candidate(s).",
+                            processed_works=processed_works,
+                            active_works=len(active_work_ids),
+                            active_work_ids=list(active_work_ids),
+                            current_work_id=next(iter(active_work_ids), ""),
+                            current_index=next_index,
+                        )
+            finally:
+                cancelled = self.engine._is_run_cancelled(run_id)
+                if cancelled:
+                    for pending in futures:
+                        pending.cancel()
+                executor.shutdown(wait=not cancelled, cancel_futures=cancelled)
             final_status = "complete" if not errors else "error"
             final_message = "Cloud crawler research complete." if not errors else "Cloud crawler research finished with per-work failures."
             run = update(final_status, final_message)
@@ -1891,13 +2279,16 @@ class PrincipiaRequestHandler(BaseHTTPRequestHandler):
         except CancelledRun:
             run = self.store.get_item("research_runs", run_id) or {"run_id": run_id}
             for work_id in work_ids:
-                status = self.engine.cloud_work_research_status(work_id, field_id=field_id)
+                status = self.engine.cloud_work_research_status(work_id, field_id=field_id, model_mode=model_mode)
                 if status.get("ready_to_sync"):
-                    self.engine._set_cloud_work_research_state(work_id, "ready", run_id=run_id, message="Extraction complete and ready to sync.")
+                    self.engine._set_cloud_work_research_state(work_id, "ready", model_mode=model_mode, run_id=run_id, message="Extraction complete and ready to sync.")
+                    self.engine._set_cloud_work_task_state(work_id, "done", model_mode=model_mode, run_id=run_id, message="Extraction complete and ready to sync.")
                     continue
                 work = self.store.get_item("source_works", work_id) or {}
-                if work.get("cloud_research_run_id") == run_id and work.get("cloud_research_state") == "researching":
-                    self.engine._set_cloud_work_research_state(work_id, "stopped", run_id=run_id, message="Research was stopped before this paper finished.")
+                status = self.engine.cloud_work_research_status(work_id, field_id=field_id, model_mode=model_mode)
+                if status.get("run_id") == run_id and status.get("state") == "researching":
+                    self.engine._set_cloud_work_research_state(work_id, "stopped", model_mode=model_mode, run_id=run_id, message="Research was stopped before this paper finished.")
+                    self.engine._set_cloud_work_task_state(work_id, "stopped", model_mode=model_mode, run_id=run_id, message="Research was stopped before this paper finished.")
             self.engine._mark_run_cancelled(run)
         except Exception as exc:
             errors.append(str(exc))
@@ -1915,6 +2306,118 @@ class PrincipiaRequestHandler(BaseHTTPRequestHandler):
             except Exception:
                 return None
 
+    def _start_cloud_publish_job(
+        self,
+        contribution_path: str,
+        *,
+        local_work_ids: list[str],
+        field_id: str,
+        model_mode: str,
+        upload_mode: str,
+        branch: str,
+        remote: str,
+        base_branch: str,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        status = log_upload_status(
+            self.store.path,
+            contribution_path=contribution_path,
+            status="publishing",
+            upload_mode=upload_mode,
+        )
+        upload_id = str(status.get("upload_id") or "")
+
+        def worker() -> None:
+            direct_push: dict[str, Any] = {}
+            cloud_publish: dict[str, Any] = {}
+            upload_state = "prepared"
+            error = ""
+            try:
+                direct_push = maintainer_direct_push(
+                    contribution_path,
+                    ROOT_DIR,
+                    branch=branch,
+                    remote=remote,
+                    base_branch=base_branch,
+                    push=not dry_run,
+                )
+                direct_submitted = bool(
+                    direct_push.get("ok")
+                    and (direct_push.get("pushed") or "already exists" in str(direct_push.get("message") or "").lower())
+                )
+                cloud_publish = (
+                    publish_cloud_contribution(
+                        contribution_path,
+                        ROOT_DIR,
+                        direct_push=direct_push,
+                        branch=branch,
+                        remote=remote,
+                        base_branch=base_branch,
+                        trigger_workflow=not dry_run,
+                        local_snapshot=not dry_run,
+                    )
+                    if direct_submitted
+                    else {}
+                )
+                upload_state = "published" if cloud_publish.get("ok") and cloud_publish.get("available_for_search") else ("submitted" if direct_submitted else "prepared")
+                if not direct_push.get("ok"):
+                    upload_state = "error"
+                    error = str(direct_push.get("error") or "direct push did not complete")
+                if upload_state == "published":
+                    self.engine.mark_cloud_synced(
+                        self.engine._ordered_unique([*local_work_ids, *self._work_ids_from_contribution(contribution_path)]),
+                        field_id=field_id,
+                        contribution_path=contribution_path,
+                        upload_id=upload_id,
+                        status="synced",
+                        model_mode=model_mode,
+                    )
+            except Exception as exc:
+                upload_state = "error"
+                error = str(exc)
+            self._update_cloud_upload_log(upload_id, upload_state, error=error)
+
+        threading.Thread(
+            target=worker,
+            name=f"principia-cloud-publish-{upload_id or int(time.time() * 1000)}",
+            daemon=True,
+        ).start()
+        return {
+            "upload_id": upload_id,
+            "status": "publishing",
+            "contribution_path": contribution_path,
+            "background_publish": {
+                "started": True,
+                "upload_id": upload_id,
+                "status_url": f"/api/v1/cloud/upload/status?upload_id={upload_id}",
+            },
+        }
+
+    def _update_cloud_upload_log(self, upload_id: str, status: str, *, error: str = "") -> None:
+        if not upload_id:
+            return
+        completed = utc_now() if status in {"prepared", "submitted", "published", "error"} else None
+        github_pr_url = f"error: {error[:480]}" if error else ""
+        with sqlite3.connect(self.store.path, timeout=30) as conn:
+            if github_pr_url:
+                conn.execute(
+                    """
+                    UPDATE cloud_upload_log
+                    SET status = ?, github_pr_url = ?, completed_at = COALESCE(?, completed_at)
+                    WHERE upload_id = ?
+                    """,
+                    (status, github_pr_url, completed, upload_id),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE cloud_upload_log
+                    SET status = ?, completed_at = COALESCE(?, completed_at)
+                    WHERE upload_id = ?
+                    """,
+                    (status, completed, upload_id),
+                )
+
     def _work_ids_from_contribution(self, contribution_path: str) -> list[str]:
         try:
             path = Path(contribution_path)
@@ -1930,12 +2433,66 @@ class PrincipiaRequestHandler(BaseHTTPRequestHandler):
                 ids.append(str(work.get("work_id")))
         return self.engine._ordered_unique(ids)
 
-    def _send_json(self, data: object, status: int = 200) -> None:
+    def _cloud_record_upload_quality(self, bucket: str, item: dict[str, Any]) -> dict[str, Any]:
+        if bucket not in {"benchmark_records", "baseline_records"}:
+            return {"ok": True, "score": 1.0, "reasons": []}
+        reasons: list[str] = []
+        score = 0.0
+        if bucket == "benchmark_records":
+            name = str(item.get("benchmark_name") or item.get("dataset") or item.get("canonical_label") or "").strip()
+            task = str(item.get("task") or item.get("description") or "").strip()
+            metrics = item.get("metrics") or item.get("metric") or []
+            metric_count = len(metrics) if isinstance(metrics, list) else (1 if metrics else 0)
+            links = [item.get("official_url"), item.get("url_or_doi"), *(item.get("candidate_dataset_pages") or []), *(item.get("source_urls") or [])]
+            if name:
+                score += 0.35
+            else:
+                reasons.append("missing benchmark name or dataset")
+            if task:
+                score += 0.25
+            else:
+                reasons.append("missing benchmark task/description")
+            if metric_count:
+                score += 0.2
+            else:
+                reasons.append("missing metric")
+            if any(str(link or "").startswith("http") for link in links):
+                score += 0.1
+            if item.get("source_work_ids") or item.get("work_id") or item.get("source_works"):
+                score += 0.1
+            else:
+                reasons.append("missing source work link")
+        else:
+            name = str(item.get("baseline_name") or item.get("canonical_label") or "").strip()
+            method = str(item.get("core_idea") or item.get("methodology") or item.get("description") or item.get("principle") or "").strip()
+            evidence = item.get("performance") or item.get("benchmarks") or item.get("evidence") or item.get("source_work_ids") or item.get("source_works")
+            if name:
+                score += 0.35
+            else:
+                reasons.append("missing baseline name")
+            if method:
+                score += 0.35
+            else:
+                reasons.append("missing baseline method/core idea")
+            if evidence:
+                score += 0.2
+            else:
+                reasons.append("missing benchmark/performance/source evidence")
+            if item.get("source_work_ids") or item.get("work_id") or item.get("source_works"):
+                score += 0.1
+        ok = score >= 0.55
+        if not ok and not reasons:
+            reasons.append("quality score below upload threshold")
+        return {"ok": ok, "score": round(score, 3), "reasons": reasons}
+
+    def _send_json(self, data: object, status: int = 200, *, headers: dict[str, str] | None = None) -> None:
         status_code, body, content_type = _json_bytes(data, status)
         self.send_response(status_code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
         self.end_headers()
         self.wfile.write(body)
 

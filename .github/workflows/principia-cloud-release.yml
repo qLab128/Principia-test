@@ -1,11 +1,17 @@
 name: principia-cloud-release
 
 on:
+  push:
+    branches:
+      - main
+      - "codex/cloud-contribution-*"
+    paths:
+      - "cloud/contributions/**"
   workflow_dispatch:
     inputs:
       tag:
         description: "Release tag"
-        required: true
+        required: false
       db:
         description: "SQLite database to export"
         default: "data/principia.sqlite"
@@ -38,19 +44,47 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Resolve cloud release inputs
+        id: cloud_inputs
+        run: |
+          tag="${TAG_INPUT:-principia-cloud-${GITHUB_SHA::12}}"
+          source="${SOURCE_INPUT:-contributions}"
+          db="${DB_INPUT:-data/principia.sqlite}"
+          input_dir="${INPUT_DIR_INPUT:-cloud/contributions}"
+          output_dir="${OUTPUT_DIR_INPUT:-dist/cloud}"
+          work_shards="${WORK_SHARDS_INPUT:-256}"
+          concept_shards="${CONCEPT_SHARDS_INPUT:-64}"
+          limit="${LIMIT_INPUT:-0}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "source=${source}" >> "$GITHUB_OUTPUT"
+          echo "db=${db}" >> "$GITHUB_OUTPUT"
+          echo "input_dir=${input_dir}" >> "$GITHUB_OUTPUT"
+          echo "output_dir=${output_dir}" >> "$GITHUB_OUTPUT"
+          echo "work_shards=${work_shards}" >> "$GITHUB_OUTPUT"
+          echo "concept_shards=${concept_shards}" >> "$GITHUB_OUTPUT"
+          echo "limit=${limit}" >> "$GITHUB_OUTPUT"
+        env:
+          TAG_INPUT: "${{ inputs.tag }}"
+          SOURCE_INPUT: "${{ inputs.source }}"
+          DB_INPUT: "${{ inputs.db }}"
+          INPUT_DIR_INPUT: "${{ inputs.input_dir }}"
+          OUTPUT_DIR_INPUT: "${{ inputs.output_dir }}"
+          WORK_SHARDS_INPUT: "${{ inputs.work_shards }}"
+          CONCEPT_SHARDS_INPUT: "${{ inputs.concept_shards }}"
+          LIMIT_INPUT: "${{ inputs.limit }}"
       - name: Build cloud snapshot
         run: |
-          if [ "${{ inputs.source }}" = "contributions" ]; then
+          if [ "${{ steps.cloud_inputs.outputs.source }}" = "contributions" ]; then
             python principia.py cloud compact \
-              --input "${{ inputs.input_dir }}" \
-              --out "${{ inputs.output_dir }}"
+              --input "${{ steps.cloud_inputs.outputs.input_dir }}" \
+              --out "${{ steps.cloud_inputs.outputs.output_dir }}"
           else
             python principia.py cloud export-snapshot \
-              --db "${{ inputs.db }}" \
-              --out "${{ inputs.output_dir }}" \
-              --work-shards "${{ inputs.work_shards }}" \
-              --concept-shards "${{ inputs.concept_shards }}" \
-              --limit "${{ inputs.limit }}"
+              --db "${{ steps.cloud_inputs.outputs.db }}" \
+              --out "${{ steps.cloud_inputs.outputs.output_dir }}" \
+              --work-shards "${{ steps.cloud_inputs.outputs.work_shards }}" \
+              --concept-shards "${{ steps.cloud_inputs.outputs.concept_shards }}" \
+              --limit "${{ steps.cloud_inputs.outputs.limit }}"
           fi
       - name: Rewrite manifest URLs and pointer
         run: |
@@ -83,21 +117,21 @@ jobs:
           pointer_path.write_text(json.dumps(pointer, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
           PY
         env:
-          PRINCIPIA_CLOUD_TAG: "${{ inputs.tag }}"
-          PRINCIPIA_CLOUD_OUTPUT_DIR: "${{ inputs.output_dir }}"
+          PRINCIPIA_CLOUD_TAG: "${{ steps.cloud_inputs.outputs.tag }}"
+          PRINCIPIA_CLOUD_OUTPUT_DIR: "${{ steps.cloud_inputs.outputs.output_dir }}"
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: "${{ inputs.tag }}"
+          tag_name: "${{ steps.cloud_inputs.outputs.tag }}"
           files: |
-            ${{ inputs.output_dir }}/manifest.json
-            ${{ inputs.output_dir }}/stats.json
-            ${{ inputs.output_dir }}/checksums.sha256
-            ${{ inputs.output_dir }}/packs/*
-            ${{ inputs.output_dir }}/indexes/*
+            ${{ steps.cloud_inputs.outputs.output_dir }}/manifest.json
+            ${{ steps.cloud_inputs.outputs.output_dir }}/stats.json
+            ${{ steps.cloud_inputs.outputs.output_dir }}/checksums.sha256
+            ${{ steps.cloud_inputs.outputs.output_dir }}/packs/*
+            ${{ steps.cloud_inputs.outputs.output_dir }}/indexes/*
       - name: Commit latest manifest pointer
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add cloud/manifests/latest.json
-          git commit -m "Update Principia cloud manifest pointer for ${{ inputs.tag }}" || exit 0
+          git commit -m "Update Principia cloud manifest pointer for ${{ steps.cloud_inputs.outputs.tag }}" || exit 0
           git push

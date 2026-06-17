@@ -26,6 +26,69 @@ def normalize_external_id(value: Any) -> str:
     return re.sub(r"\s+", "", str(value or "").strip().lower())
 
 
+def normalize_arxiv_id(value: Any) -> str:
+    value = normalize_external_id(value)
+    value = re.sub(r"\.(?:pdf|html)$", "", value)
+    return re.sub(r"v\d+$", "", value)
+
+
+def _iter_identity_values(work: dict[str, Any]) -> list[str]:
+    values: list[Any] = [
+        work.get("doi"),
+        work.get("DOI"),
+        work.get("url_or_doi"),
+        work.get("paper_link"),
+        work.get("source_paper_link"),
+        work.get("official_url"),
+    ]
+    for key in ("source_urls", "source_paper_links", "links"):
+        raw = work.get(key)
+        if isinstance(raw, list):
+            values.extend(raw)
+        elif raw:
+            values.append(raw)
+    return [str(value).strip() for value in values if str(value or "").strip()]
+
+
+def _extract_arxiv_id(value: str) -> str:
+    text = str(value or "").strip()
+    patterns = [
+        r"arxiv\.org/(?:abs|pdf|html)/([^?#/\s]+)",
+        r"(?:^|\b)arxiv\s*:\s*([a-z-]+/\d{7}|[0-9]{4}\.[0-9]{4,5}(?:v\d+)?)",
+    ]
+    if "arxiv" in text.lower():
+        patterns.append(r"\b([a-z-]+/\d{7}|[0-9]{4}\.[0-9]{4,5}(?:v\d+)?)\b")
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return normalize_arxiv_id(match.group(1))
+    return ""
+
+
+def _extract_doi(value: str) -> str:
+    text = str(value or "").strip()
+    match = re.search(r"(?:doi\.org/|doi\s*:\s*)?(10\.\d{4,9}/[^\s?#<>\"']+)", text, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    return normalize_external_id(match.group(1).rstrip(".,);]"))
+
+
+def _extract_openreview_forum_id(value: str) -> str:
+    text = str(value or "").strip()
+    match = re.search(r"openreview\.net/(?:forum|pdf)\?id=([^&#\s]+)", text, flags=re.IGNORECASE)
+    if match:
+        return normalize_external_id(match.group(1))
+    return ""
+
+
+def _first_extracted(values: list[str], extractor) -> str:
+    for value in values:
+        extracted = extractor(value)
+        if extracted:
+            return extracted
+    return ""
+
+
 def best_identity_key(keys: dict[str, str]) -> str:
     for name in ("doi", "arxiv_id", "openreview_forum_id", "openalex_id", "semantic_scholar_id", "crossref_id", "title_hash"):
         value = str(keys.get(name) or "").strip()
@@ -36,17 +99,18 @@ def best_identity_key(keys: dict[str, str]) -> str:
 
 def candidate_identity_keys(work: dict[str, Any]) -> dict[str, str]:
     sig = work_content_signature(work)
+    identity_values = _iter_identity_values(work)
     keys = {
         "canonical_title": str(work.get("canonical_title") or work.get("title") or "").strip(),
         "title_hash": str(work.get("title_hash") or sig.get("title_hash") or "").strip(),
         "abstract_hash": str(work.get("abstract_hash") or sig.get("abstract_hash") or "").strip(),
         "content_hash": str(work.get("content_hash") or sig.get("content_hash") or "").strip(),
-        "doi": normalize_external_id(work.get("doi") or work.get("DOI") or ""),
-        "arxiv_id": normalize_external_id(work.get("arxiv_id") or ""),
+        "doi": normalize_external_id(work.get("doi") or work.get("DOI") or _first_extracted(identity_values, _extract_doi)),
+        "arxiv_id": normalize_arxiv_id(work.get("arxiv_id") or _first_extracted(identity_values, _extract_arxiv_id)),
         "openalex_id": normalize_external_id(work.get("openalex_id") or ""),
         "crossref_id": normalize_external_id(work.get("crossref_id") or ""),
         "semantic_scholar_id": normalize_external_id(work.get("semantic_scholar_id") or ""),
-        "openreview_forum_id": normalize_external_id(work.get("openreview_forum_id") or ""),
+        "openreview_forum_id": normalize_external_id(work.get("openreview_forum_id") or _first_extracted(identity_values, _extract_openreview_forum_id)),
     }
     return {key: value for key, value in keys.items() if value}
 

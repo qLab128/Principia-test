@@ -122,7 +122,7 @@ def evaluate_upload_candidates(
         conn.row_factory = sqlite3.Row
         works = _rows(conn, "SELECT * FROM global_work" + _where_work_ids(work_ids), work_ids)
         versions = _latest_versions(conn, [row["work_id"] for row in works])
-        extraction_status = _required_extraction_status(conn, [row["work_id"] for row in works])
+        extraction_status = _required_extraction_status(conn, [row["work_id"] for row in works], model_key=model_key)
     candidates = [_candidate_for_upload(row, versions.get(row["work_id"])) for row in works]
     if not candidates:
         return []
@@ -162,25 +162,37 @@ def evaluate_upload_candidates(
     return output
 
 
-def _required_extraction_status(conn: sqlite3.Connection, work_ids: list[str]) -> dict[str, dict[str, Any]]:
-    required = ("existed_idea", "principle", "takeaway_message")
+def _required_extraction_status(conn: sqlite3.Connection, work_ids: list[str], *, model_key: str = "") -> dict[str, dict[str, Any]]:
+    core_types = ("existed_idea", "principle")
     status = {
-        str(work_id): {"counts": {key: 0 for key in required}, "missing_required": list(required)}
+        str(work_id): {"counts": {key: 0 for key in core_types}, "missing_required": ["principle_or_existed_idea"]}
         for work_id in work_ids
         if str(work_id or "")
     }
     if not status:
         return status
     placeholders = ",".join("?" for _ in status)
+    model_parts = _parse_model_key(model_key)
+    model_join = ""
+    model_where = ""
+    params: list[Any] = list(status.keys())
+    if model_parts:
+        model_join = "JOIN concept_version ON concept_version.concept_version_id = evidence_link.concept_version_id"
+        model_where = "AND concept_version.llm_provider = ? AND concept_version.llm_model = ? AND concept_version.model_mode = ?"
+        params.extend([model_parts["provider"], model_parts["model"], model_parts["mode"]])
     rows = conn.execute(
         f"""
         SELECT evidence_link.work_id AS work_id, concept_card.concept_type AS concept_type, COUNT(DISTINCT concept_card.concept_id) AS count
         FROM evidence_link
         JOIN concept_card ON concept_card.concept_id = evidence_link.concept_id
+        {model_join}
         WHERE evidence_link.work_id IN ({placeholders})
+        AND COALESCE(concept_card.confidence_score, 0) >= 0.35
+        AND LENGTH(TRIM(COALESCE(concept_card.canonical_label, ''))) > 0
+        {model_where}
         GROUP BY evidence_link.work_id, concept_card.concept_type
         """,
-        list(status.keys()),
+        params,
     ).fetchall()
     aliases = {
         "existed_ideas": "existed_idea",
@@ -195,8 +207,16 @@ def _required_extraction_status(conn: sqlite3.Connection, work_ids: list[str]) -
         if work_id in status and concept_type in status[work_id]["counts"]:
             status[work_id]["counts"][concept_type] += int(row["count"] or 0)
     for item in status.values():
-        item["missing_required"] = [key for key, count in item["counts"].items() if count <= 0]
+        has_core_record = any(int(item["counts"].get(key, 0) or 0) > 0 for key in core_types)
+        item["missing_required"] = [] if has_core_record else ["principle_or_existed_idea"]
     return status
+
+
+def _parse_model_key(model_key: str) -> dict[str, str]:
+    parts = str(model_key or "").split(":")
+    if len(parts) < 3:
+        return {}
+    return {"provider": parts[0], "model": parts[1], "mode": parts[2]}
 
 
 def log_upload_status(db_path: Path, *, contribution_path: str, status: str, github_pr_url: str = "", upload_mode: str = "normal") -> dict[str, Any]:
@@ -210,7 +230,7 @@ def log_upload_status(db_path: Path, *, contribution_path: str, status: str, git
             )
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (upload_id, contribution_path, github_pr_url, upload_mode, status, utc_now(), utc_now() if status in {"prepared", "submitted"} else None),
+            (upload_id, contribution_path, github_pr_url, upload_mode, status, utc_now(), utc_now() if status in {"prepared", "submitted", "published", "error"} else None),
         )
     return {"upload_id": upload_id, "status": status, "contribution_path": contribution_path, "github_pr_url": github_pr_url}
 

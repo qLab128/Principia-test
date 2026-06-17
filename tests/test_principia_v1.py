@@ -1723,7 +1723,7 @@ class PrincipiaTests(unittest.TestCase):
 
     def test_v1_idea_assembler_persists_traceable_idea_at_top(self) -> None:
         store = self.make_store()
-        engine = PrincipiaEngine(store=store, llm=NoLLM())  # type: ignore[arg-type]
+        engine = PrincipiaEngine(store=store, llm=FakeV2LLM())  # type: ignore[arg-type]
         project = engine.create_project(
             name="Assembler Project",
             description="Project-scoped evidence synthesis",
@@ -1937,7 +1937,7 @@ class PrincipiaTests(unittest.TestCase):
         self.assertTrue(any(item["dataset"] == "ImageNet" for item in store.list_items("benchmark_records", limit=20)))
         self.assertTrue(any(item["baseline_name"] == "CoOp" for item in store.list_items("baseline_records", limit=20)))
 
-    def test_v2_research_limits_structured_extraction_to_selected_works(self) -> None:
+    def test_v2_research_processes_all_unresearched_works_in_batches(self) -> None:
         store = self.make_store()
         engine = PrincipiaEngine(store=store, llm=NoLLM())  # type: ignore[arg-type]
         project = engine.create_project(name="Clip-FS", goal_text=VISION_CLIP_TTT_QUERY)
@@ -1954,6 +1954,8 @@ class PrincipiaTests(unittest.TestCase):
             for index in range(40)
         ]
         structured_calls: list[str] = []
+        fetch_calls: list[str] = []
+        progress_events: list[dict] = []
         original_search = engine_module.search_hybrid_sources
         original_fetch = engine_module.fetch_transient_full_text
         original_extract = engine.extract_benchmark_records
@@ -1962,19 +1964,104 @@ class PrincipiaTests(unittest.TestCase):
             structured_calls.append(str(work.get("work_id") or ""))
             return {"benchmark_records": [], "baseline_records": [], "result_records": []}
 
+        def fake_fetch(work, *args, **kwargs):
+            fetch_calls.append(str(work.get("work_id") or ""))
+            return "Agentic process quality control evaluates checkpoints, feedback, and repository repair accuracy."
+
+        def capture_progress(run):
+            progress_events.append({"stage": run.get("stage"), "counts": dict(run.get("counts") or {})})
+
         engine_module.search_hybrid_sources = lambda *args, **kwargs: works
-        engine_module.fetch_transient_full_text = lambda *args, **kwargs: ""
+        engine_module.fetch_transient_full_text = fake_fetch
         engine.extract_benchmark_records = fake_extract  # type: ignore[method-assign]
         try:
-            result = engine.v2_research_project(project["field_id"], goal_text=project["goal_text"], model_mode="deepseek_pro", target_works=40)
+            result = engine.v2_research_project(
+                project["field_id"],
+                goal_text=project["goal_text"],
+                model_mode="deepseek_pro",
+                target_works=40,
+                progress_callback=capture_progress,
+            )
         finally:
             engine_module.search_hybrid_sources = original_search
             engine_module.fetch_transient_full_text = original_fetch
             engine.extract_benchmark_records = original_extract  # type: ignore[method-assign]
 
+        batch_events = [event for event in progress_events if event["stage"] == "full_text_batch"]
+        cleanup_events = [event for event in progress_events if event["stage"] == "full_text_batch_cleanup"]
         self.assertEqual(result["summary"]["counts"]["works"], 40)
-        self.assertLess(len(structured_calls), 40)
-        self.assertLessEqual(len(structured_calls), engine._v2_llm_extraction_limit("deepseek_pro"))
+        self.assertEqual(len(set(structured_calls)), 40)
+        self.assertEqual(len(fetch_calls), 40)
+        self.assertEqual([event["counts"].get("batch_works") for event in batch_events], [10, 10, 10, 10])
+        self.assertEqual([event["counts"].get("full_text_retained") for event in cleanup_events], [0, 0, 0, 0])
+        self.assertEqual(result["run"]["counts"]["planned_works"], 40)
+        self.assertEqual(result["run"]["counts"]["processed_works"], 40)
+        self.assertEqual(result["run"]["counts"]["research_batches_total"], 4)
+        self.assertEqual(result["run"]["counts"]["full_text_retained"], 0)
+
+    def test_v2_research_counts_already_researched_works_on_second_run(self) -> None:
+        store = self.make_store()
+        engine = PrincipiaEngine(store=store, llm=FakeV2LLM())  # type: ignore[arg-type]
+        project = engine.create_project(name="Agentic QC", goal_text="agentic quality control")
+        works = [
+            {
+                "work_id": f"W-AQC-{index}",
+                "title": f"Agentic quality control paper {index}",
+                "authors": ["A. Researcher"],
+                "year": 2026,
+                "venue_or_source": "ICML",
+                "url_or_doi": f"https://example.org/aqc-{index}",
+                "abstract": (
+                    "This paper studies agentic process quality control. "
+                    "The principle is that autonomous coding agents need calibrated checkpoints and actionable feedback. "
+                    "Experiments evaluate SWE-bench and repository repair accuracy."
+                ),
+            }
+            for index in range(3)
+        ]
+        original_search = engine_module.search_hybrid_sources
+        original_fetch = engine_module.fetch_transient_full_text
+        engine_module.search_hybrid_sources = lambda *args, **kwargs: works
+        engine_module.fetch_transient_full_text = lambda *args, **kwargs: ""
+        try:
+            first = engine.v2_research_project(project["field_id"], goal_text=project["goal_text"], model_mode="deepseek_pro", target_works=3)
+            for work in store.list_items("source_works", limit=10):
+                principle = engine._v2_upsert_canonical(
+                    "principles",
+                    f"Agentic quality control principle for {work['work_id']}",
+                    {
+                        "name": f"Agentic quality control principle for {work['work_id']}",
+                        "argument": "Agentic quality-control systems should gate autonomous changes with calibrated checkpoints and actionable feedback before accepting repository edits.",
+                        "abstract_signature": "Agentic quality-control systems should gate autonomous changes with calibrated checkpoints and actionable feedback before accepting repository edits.",
+                        "source_work_ids": [work["work_id"]],
+                        "source_works": [work["work_id"]],
+                        "evidence": "The source work describes calibrated checkpoints, actionable feedback, and repository repair accuracy.",
+                    },
+                    model_mode="deepseek_pro",
+                )
+                store.upsert_many(
+                    "evidence_links",
+                    [
+                        engine._v2_evidence_link(
+                            project["field_id"],
+                            "principles",
+                            principle["principle_id"],
+                            work["work_id"],
+                            "The source work describes calibrated checkpoints, actionable feedback, and repository repair accuracy.",
+                        )
+                    ],
+                    "link_id",
+                )
+                engine.add_project_memberships(project["field_id"], "principles", [principle["principle_id"]], source="test")
+            second = engine.v2_research_project(project["field_id"], goal_text=project["goal_text"], model_mode="deepseek_pro", target_works=3)
+        finally:
+            engine_module.search_hybrid_sources = original_search
+            engine_module.fetch_transient_full_text = original_fetch
+
+        self.assertEqual(first["run"]["counts"]["planned_works"], 3)
+        self.assertEqual(second["run"]["counts"]["planned_works"], 0)
+        self.assertEqual(second["run"]["counts"]["already_researched_works"], 3)
+        self.assertEqual(second["run"]["counts"]["skipped_unchanged_llm"], 3)
 
     def test_project_navigation_paths_do_not_require_full_snapshot(self) -> None:
         store = self.make_store()
@@ -2040,6 +2127,41 @@ class PrincipiaTests(unittest.TestCase):
         self.assertLessEqual(len(item["performance"]), 6)
         self.assertGreaterEqual(item["performance_total"], 120)
         self.assertNotIn("payload", item["active_variant"])
+
+    def test_v2_project_tab_dedupes_duplicate_existed_idea_titles(self) -> None:
+        store = self.make_store()
+        engine = PrincipiaEngine(store=store, llm=NoLLM())  # type: ignore[arg-type]
+        project = engine.create_project(name="Duplicate Ideas", goal_text="cooperation metrics")
+        duplicated_title = "Ethical Cooperation Score as a Multiplicative Composite Metric"
+        store.upsert_many(
+            "existed_ideas",
+            [
+                {
+                    "canonical_id": "XI-DUP-A",
+                    "title": duplicated_title,
+                    "idea_text": "A short duplicate description.",
+                    "source_work_ids": ["W-A"],
+                    "updated_at": "2026-01-01T00:00:00Z",
+                },
+                {
+                    "canonical_id": "XI-DUP-B",
+                    "title": duplicated_title,
+                    "idea_text": "A fuller duplicate description that should win presentation dedupe.",
+                    "mechanism": "The richer record explains how the cooperation score is computed and where it should be validated.",
+                    "discussion": "The richer record is more useful for users and should be retained when two linked records share a display title.",
+                    "source_work_ids": ["W-A", "W-B"],
+                    "updated_at": "2026-02-01T00:00:00Z",
+                },
+            ],
+            "canonical_id",
+        )
+        engine.add_project_memberships(project["field_id"], "existed_ideas", ["XI-DUP-A", "XI-DUP-B"])
+
+        tab = engine.build_v2_project_tab(project["field_id"], "existed_ideas", limit=10)
+
+        self.assertEqual(tab["total"], 1)
+        self.assertEqual(tab["counts"]["existed_ideas"], 1)
+        self.assertEqual(tab["items"][0]["canonical_id"], "XI-DUP-B")
 
     def test_stale_running_research_becomes_partial_error_with_kept_records(self) -> None:
         store = self.make_store()
@@ -2308,6 +2430,135 @@ class PrincipiaTests(unittest.TestCase):
         self.assertNotIn("12%", sanitized["mechanistic_design"][0])
         self.assertIn("measured validation protocol", sanitized["novelty_claim"])
 
+    def test_v2_repair_my_idea_rewrites_raw_symbolic_mechanistic_design(self) -> None:
+        engine = PrincipiaEngine(store=self.make_store(), llm=NoLLM())  # type: ignore[arg-type]
+
+        repaired = engine._v2_repair_my_idea_payload(
+            {
+                "title": "Semantic-Anchor Dual Adapter",
+                "one_sentence_thesis": "Use semantic anchors to decide when adaptation should change a CLIP representation.",
+                "novelty_claim": "The method adds an evidence-gated adapter rather than copying a prior test-time update rule.",
+                "mechanistic_design": [
+                    "C_X controls R_t and p_i before the adapter revises this node.",
+                    "This node merges the previous evidence into a synthesis score.",
+                ],
+                "derived_principles": ["Adaptation should be gated by semantic validity before updating the visual representation."],
+                "relevant_baselines": ["test-time CLIP adaptation"],
+            }
+        )
+
+        joined = " ".join(repaired["mechanistic_design"])
+        self.assertNotIn("C_X", joined)
+        self.assertNotIn("this node", joined.lower())
+        self.assertIn("Evidence representation", repaired["mechanistic_design"][0])
+
+    def test_v2_repair_my_idea_rewrites_template_novelty_claim(self) -> None:
+        engine = PrincipiaEngine(store=self.make_store(), llm=NoLLM())  # type: ignore[arg-type]
+
+        repaired = engine._v2_repair_my_idea_payload(
+            {
+                "title": "Factory-Floor Defect Thermodynamics",
+                "one_sentence_thesis": "Use localized entropy to route verification resources before autonomous code defects propagate.",
+                "novelty_claim": "Unlike prior repository agents, this method adds entropy checks.",
+                "mechanistic_design": [
+                    "Maintain per-file uncertainty, verification budget, and escalation state; route each generated patch through the cheapest verifier that can reduce local defect risk before merge.",
+                ],
+            }
+        )
+
+        claim = repaired["novelty_claim"]
+        self.assertFalse(claim.lower().startswith("unlike "))
+        self.assertIn("methodological novelty", claim)
+        self.assertIn("autonomous-code quality control", claim)
+        self.assertIn("intervention variables", claim)
+
+    def test_v2_repair_my_idea_normalizes_dropped_latex_commands(self) -> None:
+        engine = PrincipiaEngine(store=self.make_store(), llm=NoLLM())  # type: ignore[arg-type]
+
+        repaired = engine._v2_repair_my_idea_payload(
+            {
+                "title": "Factory-Floor Defect Thermodynamics",
+                "one_sentence_thesis": "Use localized entropy to route verification resources.",
+                "novelty_claim": "Replace global $ au$ with $H_t: ext{Files} o eal$ and $\beta_t: ext{Files} o eal_{>0}$.",
+                "generation_mode": "llm",
+                "derivation_id": "DR-LEGACY-SOURCE",
+                "mechanistic_design": [
+                    "The generator submits a process signature $ heta_c$ before the verifier computes $ abla H_f = H(c) - H(c_{prev})$.",
+                    "Freeze merges for file $f$ and propagate a pressure wave $P_{wa...",
+                    "The acceptance probability is $A_c = rac{1}{1 + e^{(E(c) - \\beta_f)/k}}$.",
+                    "The entropy term is $H(\\\x08ullet)$ and the expected entropy is $\\\x08ar{H}$; older displays sometimes showed $H(\\ullet)$ or $\\arH$.",
+                ],
+            }
+        )
+
+        joined = " ".join([repaired["novelty_claim"], *repaired["mechanistic_design"]])
+        self.assertNotIn("Evidence representation", repaired["mechanistic_design"][0])
+        self.assertIn("$\\tau$", joined)
+        self.assertIn("$H_t: \\text{Files} \\to \\mathbb{R}$", joined)
+        self.assertIn("$\\beta_t: \\text{Files} \\to \\mathbb{R}_{>0}$", joined)
+        self.assertIn("$\\theta_c$", joined)
+        self.assertIn("$\\nabla H_f = H(c) - H(c_{prev})$", joined)
+        self.assertIn("$A_c = \\frac{1}{1 + e^{(E(c) - \\beta_f)/k}}$", joined)
+        self.assertIn("$H(\\bullet)$", joined)
+        self.assertIn("$\\bar{H}$", joined)
+        self.assertNotIn("\x08", joined)
+        self.assertNotIn("\\ullet", joined)
+        self.assertNotIn("\\arH", joined)
+        self.assertNotIn("$P_{wa", joined)
+
+    def test_v2_repair_my_idea_wraps_bare_mathcal_loss_formulas(self) -> None:
+        engine = PrincipiaEngine(store=self.make_store(), llm=NoLLM())  # type: ignore[arg-type]
+
+        repaired = engine._v2_repair_my_idea_payload(
+            {
+                "title": "Uncertainty-Gated Joint View Synthesis and Reconstruction (UG-JVSR)",
+                "one_sentence_thesis": "Use uncertainty-gated synthetic views to improve sparse 3D reconstruction.",
+                "novelty_claim": "UG-JVSR makes uncertainty an explicit intervention variable for view synthesis and reconstruction.",
+                "mechanistic_design": [
+                    "Algorithmic Loop: Initialize $\\Theta$ from sparse inputs. Update $\\Theta$ and $V_{syn}$ by minimizing \\mathcal{L}_{total} = \\mathcal{L}_{recon}(\\Theta,...",
+                    "Algorithmic Loop: Initialize $\\Theta$ from sparse inputs. Repeat until convergence: (1) Compute voxel-wise uncertainty map $U(\\Theta)$ via projection variance. (2) Select candidate poses $P_{cand}$ maximizing $\\int_{ray} U(\\Theta) dr$. (3) Generate $V_{syn}$ using $\\Phi$ conditioned on $P_{cand}$ and existing views. (4) Update $\\Theta$ and $V_{syn}$ by minimizing \\mathcal{L}_{total} = \\mathcal{L}_{recon}(\\Theta,...",
+                    "Scoring Rule: The selection of poses uses $S(p) = \\alpha \\cdot \\text{InfoGain}(p) - \\beta \\cdot \\text{DiffusionSteps}(p)$.",
+                ],
+            }
+        )
+
+        joined = " ".join(repaired["mechanistic_design"])
+        self.assertIn("$\\mathcal{L}_{total} = \\mathcal{L}_{recon}(\\Theta,\\ldots$", joined)
+        self.assertEqual(len(repaired["mechanistic_design"]), 3)
+        self.assertNotIn("minimizing \\mathcal{L}_{total}", joined)
+        self.assertNotIn("Evidence representation", joined)
+
+    def test_v2_repair_my_idea_flattens_structured_mechanistic_design(self) -> None:
+        engine = PrincipiaEngine(store=self.make_store(), llm=NoLLM())  # type: ignore[arg-type]
+
+        repaired = engine._v2_repair_my_idea_payload(
+            {
+                "title": "IDHS-MAS: Information-Directed Dialectic Multi-Agent System",
+                "one_sentence_thesis": "Use information gain to decide whether multi-agent debate should continue.",
+                "novelty_claim": (
+                    "IDHS-MAS: Information-Directed Dialectic Multi-Agent System reframes multi-agent scientific reasoning "
+                    "as an active control problem: {'component': 'Dialect Roles', 'description': 'Agents enforce $Role_{gen}$ "
+                    "and $Role_{crit}$. $Role_{gen}$ propose s.'}"
+                ),
+                "mechanistic_design": [
+                    "{'component': 'Dialect Roles', 'description': 'Agents are instantiated with rigid system prompts enforcing $Role_{gen}$ (Hypothesis Generator) and $Role_{crit}$ (Uncertainty Auditor). $Role_{gen}$ proposes solutions $h_t$, while $Role_{crit}$ computes information gain.'}",
+                    {
+                        "component": "Acquisition Loop",
+                        "description": "Continue debate only when the expected information gain exceeds $\\tau_{info}$.",
+                    },
+                ],
+            }
+        )
+
+        joined = " ".join(repaired["mechanistic_design"])
+        self.assertIn("Dialect Roles. Agents are instantiated", joined)
+        self.assertIn("Acquisition Loop. Continue debate", joined)
+        self.assertNotIn("{'component'", joined)
+        self.assertNotIn("[object Object]", joined)
+        self.assertNotIn("propose s", repaired["novelty_claim"])
+        self.assertNotIn("{'component'", repaired["novelty_claim"])
+        self.assertNotIn("Role_{gen}", repaired["novelty_claim"])
+
     def test_v2_reasoning_pattern_query_expands_to_benchmarks_and_exemplars(self) -> None:
         engine = PrincipiaEngine(store=self.make_store(), llm=NoLLM())  # type: ignore[arg-type]
 
@@ -2439,6 +2690,29 @@ class PrincipiaTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertIn("Compared with", rows[0]["differences"])
 
+    def test_v2_related_comparison_dedupes_same_titled_prior_ideas(self) -> None:
+        store = self.make_store()
+        engine = PrincipiaEngine(store=store, llm=NoLLM())  # type: ignore[arg-type]
+        rows = [
+            {
+                "id": "XI-ONE",
+                "title": "Complexity-Adaptive Discussion Length",
+                "source_paper_title": "Multi-Agent Deliberation",
+                "similarity": "Both regulate deliberation depth.",
+            },
+            {
+                "id": "XI-TWO",
+                "title": "Complexity-Adaptive Discussion Length",
+                "source_paper_title": "Multi-Agent Deliberation",
+                "similarity": "Both regulate deliberation depth through task complexity.",
+            },
+        ]
+
+        deduped = engine._v2_dedupe_related_rows(rows)
+
+        self.assertEqual(len(deduped), 1)
+        self.assertEqual(deduped[0]["id"], "XI-ONE")
+
     def test_v2_benchmark_and_baseline_payloads_use_public_dataset_and_method_links(self) -> None:
         store = self.make_store()
         engine = PrincipiaEngine(store=store, llm=NoLLM())  # type: ignore[arg-type]
@@ -2565,6 +2839,75 @@ class PrincipiaTests(unittest.TestCase):
         self.assertEqual(page["items"][0]["work_id"], "W-NEW")
         self.assertEqual(relevant["items"][0]["work_id"], "W-OLD-RELEVANT")
         self.assertEqual(composite["items"][0]["work_id"], "W-VENUE")
+
+    def test_v2_tab_search_includes_linked_work_metadata(self) -> None:
+        store = self.make_store()
+        engine = PrincipiaEngine(store=store, llm=NoLLM())  # type: ignore[arg-type]
+        project = engine.create_project(name="Search Project", goal_text="multi agent reasoning")
+        work = engine._v2_upsert_work(
+            {
+                "work_id": "W-ICLR-AFFIL",
+                "title": "Structured Dialectic Agents",
+                "abstract": "A paper about coordinated multi-agent reasoning.",
+                "venue_or_source": "ICLR",
+                "year": 2026,
+                "authors": ["Ada Chen", "Bo Li"],
+                "affiliations": ["Stanford University", "Tsinghua University"],
+            },
+            model_mode="metadata",
+        )
+        idea = engine._v2_upsert_canonical(
+            "existed_ideas",
+            "dialectic budget controller",
+            {
+                "title": "Dialectic Budget Controller",
+                "idea_text": "Allocate discussion length according to disagreement and expected evidence gain.",
+                "source_work_ids": [work["work_id"]],
+            },
+            model_mode="efficient",
+        )
+        other = engine._v2_upsert_canonical(
+            "existed_ideas",
+            "unrelated cache routing",
+            {
+                "title": "Unrelated Cache Routing",
+                "idea_text": "Route cache lookups according to retrieval uncertainty.",
+            },
+            model_mode="efficient",
+        )
+        engine.add_project_memberships(project["field_id"], "source_works", [work["work_id"]])
+        engine.add_project_memberships(project["field_id"], "existed_ideas", [idea["canonical_id"], other["canonical_id"]])
+
+        venue_tab = engine.build_v2_project_tab(project["field_id"], "existed_ideas", query="iclr", limit=10)
+        affiliation_tab = engine.build_v2_project_tab(project["field_id"], "existed_ideas", query="stanford", limit=10)
+        work_tab = engine.build_v2_project_tab(project["field_id"], "works", query="bo li", limit=10)
+
+        self.assertEqual([item["canonical_id"] for item in venue_tab["items"]], [idea["canonical_id"]])
+        self.assertEqual([item["canonical_id"] for item in affiliation_tab["items"]], [idea["canonical_id"]])
+        self.assertEqual([item["work_id"] for item in work_tab["items"]], [work["work_id"]])
+
+    def test_v2_prepare_research_works_batch_saves_metadata_works_once(self) -> None:
+        store = self.make_store()
+        engine = PrincipiaEngine(store=store, llm=NoLLM())  # type: ignore[arg-type]
+        works = [
+            {
+                "title": f"Sparse-View 3D Reconstruction Work {index}",
+                "abstract": "Reconstruct a 3D scene from limited views using geometry priors.",
+                "venue_or_source": "CVPR",
+                "year": 2026,
+                "url_or_doi": f"https://example.org/sparse-3d/{index}",
+            }
+            for index in range(20)
+        ]
+
+        first = engine._v2_prepare_research_works_batch(works, model_mode="metadata")
+        second = engine._v2_prepare_research_works_batch(works, model_mode="metadata")
+
+        self.assertEqual(len(first), 20)
+        self.assertEqual(len(second), 20)
+        self.assertEqual(store.counts()["source_works"], 20)
+        self.assertTrue(all(item.get("work_id") for item in first))
+        self.assertTrue(all(item.get("canonical_key") for item in first))
 
     def test_v2_existed_idea_title_is_mechanism_not_work_title(self) -> None:
         store = self.make_store()
@@ -3617,6 +3960,42 @@ class PrincipiaTests(unittest.TestCase):
             )
         )
         self.assertEqual(engine._normalize_pdf_text("multi-step reason- ing ob- jective"), "multi-step reasoning objective")
+
+    def test_v2_llm_extraction_uses_adaptive_parallelism_after_rate_limit(self) -> None:
+        class RateLimitedOnceLLM(FakeV2LLM):
+            def __init__(self) -> None:
+                self.lock = threading.Lock()
+                self.extract_calls = 0
+
+            def chat_json(self, system: str, user: str, **kwargs):
+                if "extract nontrivial research structures" in system:
+                    with self.lock:
+                        self.extract_calls += 1
+                        call_number = self.extract_calls
+                    if call_number == 1:
+                        raise RuntimeError("HTTP 429: too many requests")
+                return super().chat_json(system, user, **kwargs)
+
+        engine = PrincipiaEngine(store=self.make_store(), llm=RateLimitedOnceLLM())  # type: ignore[arg-type]
+        original_sleep = engine_module.time.sleep
+        engine_module.time.sleep = lambda _seconds: None
+        self.addCleanup(setattr, engine_module.time, "sleep", original_sleep)
+        events: list[tuple[str, str, dict]] = []
+        works = [
+            {"work_id": f"W-RATE-{idx}", "title": f"Rate limited work {idx}", "abstract": "A method with routing, adaptation, benchmark conditions, and evaluation results."}
+            for idx in range(6)
+        ]
+
+        result = engine._v2_llm_extract_batch(
+            "adaptive extraction",
+            works,
+            model_mode="qwen_397b",
+            progress_callback=lambda stage, message, **counts: events.append((stage, message, counts)),
+        )
+
+        self.assertEqual(engine._v2_llm_parallelism("qwen_397b"), 5)
+        self.assertEqual(set(result), {work["work_id"] for work in works})
+        self.assertTrue(any(counts.get("llm_parallelism") == 4 for _stage, _message, counts in events))
 
     def test_v2_missing_existed_idea_triggers_targeted_recovery(self) -> None:
         class MissingIdeaThenRecoverLLM(FakeV2LLM):

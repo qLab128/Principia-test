@@ -18,6 +18,7 @@ let suppressLineageNodeClick = false;
 let nativeDragIndex = -1;
 let currentIdea = null;
 let currentMeta = {};
+let currentProject = {};
 let regenerateRunId = "";
 let regenerateTimer = null;
 let relatedComparisonRunId = "";
@@ -27,6 +28,8 @@ let redesignTimer = null;
 let comparisonWarning = "";
 let principleZoom = 1;
 let lineageZoom = 1;
+let graphViewportHeights = { principle: 0, lineage: 0 };
+const observedGraphCanvases = new WeakSet();
 
 const escapeHtml = (value) =>
   String(value ?? "")
@@ -35,6 +38,11 @@ const escapeHtml = (value) =>
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
+
+function compact(value, length = 180) {
+  const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  return text.length <= length ? text : `${text.slice(0, Math.max(0, length - 3)).trim()}...`;
+}
 
 async function api(path) {
   const response = await fetch(path);
@@ -58,7 +66,7 @@ function block(title, content) {
   if (!content || (Array.isArray(content) && !content.length)) return "";
   const body = Array.isArray(content)
     ? `<ul>${content.map((item) => `<li>${formatValue(item)}</li>`).join("")}</ul>`
-    : `<p>${escapeHtml(content)}</p>`;
+    : `<p>${formatValue(content)}</p>`;
   return `<section class="idea-section"><h2>${escapeHtml(title)}</h2>${body}</section>`;
 }
 
@@ -68,10 +76,22 @@ function humanizeKey(key) {
     .replace(/\b\w/g, (char) => char.toUpperCase());
 }
 
+function structuredObjectText(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return "";
+  const label = value.component || value.step || value.name || value.title || value.module || value.operator || value.role || "";
+  const body = value.description || value.text || value.summary || value.mechanism || value.argument || value.rationale || value.detail || value.details || value.method || "";
+  if (label && body) return `${label}. ${body}`;
+  if (body) return String(body);
+  if (label) return String(label);
+  return "";
+}
+
 function formatValue(value) {
   if (value == null || value === "") return "";
-  if (typeof value !== "object") return escapeHtml(value);
-  if (Array.isArray(value)) return value.map(formatValue).join("; ");
+  if (typeof value !== "object") return linkifyReferences(value);
+  if (Array.isArray(value)) return value.map(formatValue).filter(Boolean).join("; ");
+  const structuredText = structuredObjectText(value);
+  if (structuredText) return linkifyReferences(structuredText);
   return `<dl class="inline-object">${Object.entries(value)
     .filter(([, val]) => val !== "" && val != null && !(Array.isArray(val) && !val.length))
     .map(([key, val]) => `<dt>${escapeHtml(humanizeKey(key))}</dt><dd>${formatValue(val)}</dd>`)
@@ -89,8 +109,62 @@ function graphZoomControls(target, zoom) {
       <button type="button" data-zoom-target="${escapeHtml(target)}" data-zoom-reset="true">Reset</button>
       <button type="button" data-zoom-target="${escapeHtml(target)}" data-zoom-delta="0.15">Zoom In</button>
       <span>${Math.round(zoom * 100)}%</span>
+      <span class="graph-resize-hint">Drag the lower-right corner to resize</span>
     </div>
   `;
+}
+
+function graphCanvasSelector(target) {
+  return target === "lineage" ? "#symbolicLineage .lineage-canvas" : "#principleMap .principle-canvas";
+}
+
+function graphViewportHeight(target, fallback) {
+  const stored = Number(graphViewportHeights[target] || 0);
+  const min = target === "lineage" ? 380 : 340;
+  return clampNumber(stored || fallback, min, 900);
+}
+
+function wireGraphResize(target) {
+  const canvas = document.querySelector(graphCanvasSelector(target));
+  if (!canvas || observedGraphCanvases.has(canvas)) return;
+  observedGraphCanvases.add(canvas);
+  if (typeof ResizeObserver === "undefined") return;
+  const observer = new ResizeObserver((entries) => {
+    const height = Math.round(entries[0]?.contentRect?.height || 0);
+    if (height > 0) graphViewportHeights[target] = height;
+  });
+  observer.observe(canvas);
+}
+
+function scheduleGraphResizeWiring(target) {
+  window.requestAnimationFrame(() => wireGraphResize(target));
+}
+
+function ensureGraphBounds(target, nodes, nodeWidth, heightForNode, zoom, padding = 160) {
+  const canvas = document.querySelector(graphCanvasSelector(target));
+  if (!canvas) return { width: 980, height: 420 };
+  const layer = canvas.querySelector(".graph-zoom-layer");
+  const surface = canvas.querySelector(".graph-zoom-surface");
+  const maxX = Math.max(0, ...(nodes || []).map((node) => Number(node.x || 0) + nodeWidth + padding));
+  const maxY = Math.max(0, ...(nodes || []).map((node) => Number(node.y || 0) + Number(heightForNode(node) || 110) + padding));
+  const currentWidth = Number.parseFloat(layer?.style.width || "0") || canvas.scrollWidth / Math.max(zoom, 0.1);
+  const currentHeight = Number.parseFloat(layer?.style.height || "0") || canvas.scrollHeight / Math.max(zoom, 0.1);
+  const width = Math.max(currentWidth, maxX, 900);
+  const height = Math.max(currentHeight, maxY, 360);
+  if (layer) {
+    layer.style.width = `${width}px`;
+    layer.style.height = `${height}px`;
+  }
+  if (surface) {
+    surface.style.width = `${Math.ceil(width * zoom)}px`;
+    surface.style.height = `${Math.ceil(height * zoom)}px`;
+  }
+  canvas.querySelectorAll("svg").forEach((svg) => {
+    svg.setAttribute("width", String(width));
+    svg.setAttribute("height", String(height));
+    svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  });
+  return { width, height };
 }
 
 function scaledCanvasPoint(event, canvas, zoom) {
@@ -106,12 +180,14 @@ function updateGraphZoom(target, delta = 0, reset = false) {
     lineageZoom = reset ? 1 : clampNumber(lineageZoom + delta, 0.6, 1.8);
     const root = document.getElementById("symbolicLineage");
     root.innerHTML = renderLineageGraph(lineageGraphData || {});
+    scheduleGraphResizeWiring("lineage");
     typesetMath(root);
     return;
   }
   principleZoom = reset ? 1 : clampNumber(principleZoom + delta, 0.6, 1.8);
   const root = document.getElementById("principleMap");
   root.innerHTML = renderPrincipleMap(principleMapData || {});
+  scheduleGraphResizeWiring("principle");
   typesetMath(root);
 }
 
@@ -121,6 +197,42 @@ function realUserNote(idea) {
   if (/^redesign and improve the current idea/i.test(note)) return "";
   if (/related comparison rows:/i.test(note) && note.length > 800) return "";
   return note;
+}
+
+function bucketForConceptId(conceptId) {
+  const id = String(conceptId || "").trim();
+  if (!id) return "";
+  if (id.startsWith("XI-")) return "existed_ideas";
+  if (id.startsWith("P-")) return "principles";
+  if (id.startsWith("TM-")) return "takeaway_messages";
+  if (id.startsWith("BL-")) return "baseline_records";
+  if (id.startsWith("B-")) return "benchmark_records";
+  if (id.startsWith("W-")) return "source_works";
+  if (id.startsWith("MI-")) return "my_ideas";
+  return "";
+}
+
+function lineageNodeReference(node) {
+  if (!node) return null;
+  if (node.type === "final_idea") {
+    return { bucket: "my_ideas", id: params.get("idea_id") || node.concept_id || "" };
+  }
+  const conceptId = String(node.concept_id || "").trim();
+  const bucket = bucketForConceptId(conceptId);
+  return bucket && conceptId ? { bucket, id: conceptId } : null;
+}
+
+function lineageNodeDisplayLabel(node, fallback = "") {
+  if (!node) return fallback || "";
+  const ref = lineageNodeReference(node);
+  const recordLabel = ref ? referenceLabels[ref.id]?.label : "";
+  return compact(recordLabel || node.full_label || node.summary || node.expression || node.label || fallback || "", 120);
+}
+
+function inlineSymbolButtonLabel(symbolCode, node) {
+  const label = lineageNodeDisplayLabel(node, symbolCode);
+  const wordCount = String(label || "").trim().split(/\s+/).filter(Boolean).length;
+  return wordCount > 5 ? symbolCode : label || symbolCode;
 }
 
 function linkifyReferences(value) {
@@ -143,7 +255,9 @@ function linkifyReferences(value) {
     if (ref) {
       output += `<button type="button" class="inline-ref" data-ref-id="${escapeHtml(token)}">${escapeHtml(ref.label || token)}</button>`;
     } else if (lineageSymbolLabels[token]) {
-      output += `<button type="button" class="inline-ref symbol-ref" data-symbol-code="${escapeHtml(token)}">${escapeHtml(token)}</button>`;
+      const label = lineageNodeDisplayLabel(lineageSymbolLabels[token], token);
+      const buttonLabel = inlineSymbolButtonLabel(token, lineageSymbolLabels[token]);
+      output += `<button type="button" class="inline-ref symbol-ref" data-symbol-code="${escapeHtml(token)}" title="${escapeHtml(label || token)}">${escapeHtml(buttonLabel)}</button>`;
     } else {
       output += escapeHtml(token);
     }
@@ -178,21 +292,144 @@ function richBlock(title, content) {
 }
 
 function typesetMath(root = document.body) {
-  if (window.MathJax?.typesetPromise) {
-    window.MathJax.typesetPromise([root]).catch(() => {});
+  if (!root) return;
+  normalizeMathTextNodes(root);
+  const fallback = () => renderMathFallback(root);
+  const runMathJax = () => {
+    if (!window.MathJax?.typesetPromise) {
+      fallback();
+      return;
+    }
+    window.MathJax.typesetPromise([root])
+      .then(() => replaceMathErrors(root))
+      .catch(fallback);
+  };
+  if (window.MathJax?.startup?.promise) {
+    window.MathJax.startup.promise.then(runMathJax).catch(fallback);
     return;
   }
-  renderMathFallback(root);
+  if (window.MathJax?.typesetPromise) {
+    runMathJax();
+    return;
+  }
+  window.setTimeout(() => {
+    if (window.MathJax?.typesetPromise) runMathJax();
+    else fallback();
+  }, 700);
+}
+
+function replaceMathErrors(root = document.body) {
+  if (!root) return;
+  const containers = new Set(
+    [...root.querySelectorAll("mjx-container[data-mjx-error], mjx-container [data-mjx-error], mjx-container merror, mjx-container mjx-merror")]
+      .map((node) => node.closest("mjx-container") || node)
+      .filter(Boolean)
+  );
+  containers.forEach((container) => {
+    const errorNode = container.querySelector("[data-mjx-error], merror, mjx-merror");
+    const source = container.closest(".math-source");
+    const raw = source?.getAttribute("data-original-text") || errorNode?.getAttribute("data-mjx-error") || container.getAttribute("data-original-text") || container.textContent || "";
+    const fallback = document.createElement("span");
+    fallback.className = "math-fallback math-inline";
+    fallback.title = raw;
+    const readable = readableLatex(raw.replace(/^Math input error:\s*/i, ""));
+    fallback.textContent = !readable || /Math input error|Cannot read properties/i.test(readable) ? "formula" : readable;
+    if (source) source.replaceWith(fallback);
+    else container.replaceWith(fallback);
+  });
+}
+
+function normalizeLatexFormula(value) {
+  let text = String(value ?? "")
+    .replace(/\\?\u0008ar/g, "\\bar")
+    .replace(/\\?\u0008ullet/g, "\\bullet")
+    .replace(/\\?\u0008eta/g, "\\beta")
+    .replace(/\\\\(?=[A-Za-z])/g, "\\")
+    .replace(/\.\.\./g, "\\ldots")
+    .trim();
+  text = text
+    .replace(/(^|[^\\])\bext\{/g, "$1\\text{")
+    .replace(/(^|[^\\])\brac\{/g, "$1\\frac{")
+    .replace(/(^|[^\\])\bmathbb\{/g, "$1\\mathbb{")
+    .replace(/(^|[^\\])\beal(_\{[^{}]+\})?/g, (_, prefix, subscript = "") => `${prefix}\\mathbb{R}${subscript}`)
+    .replace(/(^|[^\\])\bullet(?=\b|[{])/g, "$1\\bullet")
+    .replace(/(^|[^\\])\bar(?=\b|[{])/g, "$1\\bar")
+    .replace(/\\ullet\b/g, "\\bullet")
+    .replace(/\\ar\{([^{}]+)\}/g, "\\bar{$1}")
+    .replace(/\\ar([A-Za-z])\b/g, "\\bar{$1}")
+    .replace(/(^|[^\\])\bheta(?=\b|[_^])/g, "$1\\theta")
+    .replace(/(^|[^\\])\babla(?=\b|[_^])/g, "$1\\nabla")
+    .replace(/(^|[^\\])\bau(?=\b|[_^])/g, "$1\\tau")
+    .replace(/(^|[^\\])\bho(?=\b|[_^])/g, "$1\\rho")
+    .replace(/\\\s+(\\[A-Za-z])/g, "$1")
+    .replace(/(\\text\{[^{}]+\})\s+o\s+(\\mathbb\{R\})/g, "$1 \\to $2")
+    .replace(/\\binom\{([^{},]+),([^{}]+)\}/g, "\\{$1,$2\\}");
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function normalizeMathTextNodes(root = document.body) {
+  if (!root) return;
+  const pattern = /(\$\$[\s\S]+?\$\$|\\\[[\s\S]+?\\\]|\$[^$\n]{1,700}\$|\\\([^()\n]{1,700}\\\))/g;
+  const skipTags = new Set(["SCRIPT", "STYLE", "TEXTAREA", "INPUT", "SELECT", "OPTION", "CODE", "PRE"]);
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      const parent = node.parentElement;
+      if (!parent || skipTags.has(parent.tagName) || parent.closest(".math-fallback, .math-source, mjx-container")) return NodeFilter.FILTER_REJECT;
+      pattern.lastIndex = 0;
+      return pattern.test(node.nodeValue || "") ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+    },
+  });
+  const nodes = [];
+  while (walker.nextNode()) nodes.push(walker.currentNode);
+  nodes.forEach((node) => {
+    let original = node.nodeValue || "";
+    const dollarCount = (original.match(/\$/g) || []).length;
+    if (dollarCount % 2 === 1) {
+      const lastDollar = original.lastIndexOf("$");
+      if (lastDollar >= 0) original = `${original.slice(0, lastDollar)}${original.slice(lastDollar + 1)}`;
+    }
+    pattern.lastIndex = 0;
+    let cursor = 0;
+    let changed = false;
+    const fragment = document.createDocumentFragment();
+    for (const match of original.matchAll(pattern)) {
+      if (match.index > cursor) fragment.append(document.createTextNode(original.slice(cursor, match.index)));
+      const raw = match[0];
+      const normalized = raw.startsWith("$$")
+        ? `$$${normalizeLatexFormula(raw.slice(2, -2))}$$`
+        : raw.startsWith("$")
+          ? `$${normalizeLatexFormula(raw.slice(1, -1))}$`
+          : raw.startsWith("\\[")
+            ? `\\[${normalizeLatexFormula(raw.slice(2, -2))}\\]`
+            : `\\(${normalizeLatexFormula(raw.slice(2, -2))}\\)`;
+      const span = document.createElement("span");
+      span.className = "math-source";
+      span.setAttribute("data-original-text", normalized.replace(/^\$\$?|\$\$?$/g, "").replace(/^\\\[|\\\]$/g, "").replace(/^\\\(|\\\)$/g, ""));
+      span.textContent = normalized;
+      fragment.append(span);
+      changed = changed || normalized !== raw;
+      cursor = match.index + raw.length;
+    }
+    if (cursor < original.length) fragment.append(document.createTextNode(original.slice(cursor)));
+    if (changed || cursor > 0) node.parentNode?.replaceChild(fragment, node);
+  });
 }
 
 function readableLatex(value) {
-  return String(value ?? "")
+  const cleaned = normalizeLatexFormula(value)
     .trim()
+    .replace(/\\\\(?=[A-Za-z])/g, "\\")
     .replace(/\\frac\{([^{}]+)\}\{([^{}]+)\}/g, "($1)/($2)")
     .replace(/\\sqrt\{([^{}]+)\}/g, "sqrt($1)")
     .replace(/\\(?:mathbb|mathbf|mathrm|mathit|operatorname)\{([^{}]+)\}/g, "$1")
     .replace(/\^\{([^{}]+)\}/g, "^$1")
     .replace(/_\{([^{}]+)\}/g, "_$1")
+    .replace(/\\ldots\b/g, "…")
+    .replace(/\\dots\b/g, "…")
+    .replace(/\\,/g, " ")
+    .replace(/\\;/g, " ")
+    .replace(/\\\{/g, "{")
+    .replace(/\\\}/g, "}")
     .replace(/\\to\b/g, "->")
     .replace(/\\rightarrow\b/g, "->")
     .replace(/\\leftarrow\b/g, "<-")
@@ -221,8 +458,24 @@ function readableLatex(value) {
     .replace(/\\pi\b/g, "π")
     .replace(/\\sigma\b/g, "σ")
     .replace(/\\theta\b/g, "θ")
+    .replace(/\\bar\{([^{}]+)\}/g, "$1\u0305")
+    .replace(/\\bullet\b/g, "•")
     .replace(/\\s+/g, " ")
     .replace(/\\([A-Za-z]+)/g, "$1");
+  return formatPlainMathSubscripts(cleaned);
+}
+
+function formatPlainMathSubscripts(value) {
+  const subscript = {
+    "0": "₀", "1": "₁", "2": "₂", "3": "₃", "4": "₄", "5": "₅", "6": "₆", "7": "₇", "8": "₈", "9": "₉",
+    a: "ₐ", e: "ₑ", h: "ₕ", i: "ᵢ", j: "ⱼ", k: "ₖ", l: "ₗ", m: "ₘ", n: "ₙ", o: "ₒ", p: "ₚ", r: "ᵣ", s: "ₛ", t: "ₜ", u: "ᵤ", v: "ᵥ", x: "ₓ",
+    A: "ₐ", E: "ₑ", H: "ₕ", I: "ᵢ", J: "ⱼ", K: "ₖ", L: "ₗ", M: "ₘ", N: "ₙ", O: "ₒ", P: "ₚ", R: "ᵣ", S: "ₛ", T: "ₜ", U: "ᵤ", V: "ᵥ", X: "ₓ",
+    y: "ᵧ", Y: "ᵧ", g: "ᵍ", G: "ᵍ", b: "ᵦ", B: "ᵦ",
+  };
+  const convert = (raw) => String(raw || "").split("").map((char) => subscript[char] || char).join("");
+  return String(value || "")
+    .replace(/_\{([A-Za-z0-9]+)\}/g, (_, token) => convert(token))
+    .replace(/_([A-Za-z0-9]+)/g, (_, token) => convert(token));
 }
 
 function renderMathFallback(root = document.body) {
@@ -266,93 +519,302 @@ function renderMathFallback(root = document.body) {
   });
 }
 
+function canonicalRelatedKey(value) {
+  return String(value || "")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function relatedRowKey(row) {
+  const title = canonicalRelatedKey(row?.title || row?.name || "");
+  const source = canonicalRelatedKey(row?.source_paper_title || row?.source_work_title || "");
+  if (title) return `title:${title}|source:${source}`;
+  const id = String(row?.id || row?.canonical_id || "").trim();
+  if (id) return `id:${id}`;
+  return `body:${canonicalRelatedKey([row?.similarity, row?.differences, row?.potential_advantage].join(" ")).slice(0, 120)}`;
+}
+
+function dedupeRelatedRows(rows) {
+  const output = [];
+  const seen = new Set();
+  (rows || []).forEach((row) => {
+    if (!row || typeof row !== "object") return;
+    const key = relatedRowKey(row);
+    if (seen.has(key)) return;
+    seen.add(key);
+    output.push(row);
+  });
+  return output;
+}
+
 function renderRelated(rows) {
-  relatedRows = rows || [];
+  relatedRows = dedupeRelatedRows(rows || []);
   if (!relatedRows.length) {
     return `<p class="quality-warning">${escapeHtml(comparisonWarning || "No high-quality LLM comparison is available for this idea version.")}</p>`;
   }
   return `
-    <table class="comparison-table">
-      <thead>
-        <tr>
-          <th>Existed Idea</th>
-          <th>Mechanistic Similarity</th>
-          <th>Essential Difference</th>
-          <th>Potential Advantage</th>
-          <th>Potential Weakness</th>
-          <th>Source</th>
-        </tr>
-      </thead>
-      <tbody>
-        ${relatedRows
-          .map(
-            (row, index) => `
-              <tr>
-                <td><button type="button" class="link-button" data-related-index="${index}">${escapeHtml(row.title || row.source_paper_title || row.id || "Existed Idea")}</button></td>
-                <td><strong>${escapeHtml(row.similarity)}</strong>${expandableCell(row.similarity_points || "", `sim-${index}`)}</td>
-                <td>${expandableCell(row.differences, `diff-${index}`)}</td>
-                <td>${expandableCell(row.potential_advantage, `adv-${index}`)}</td>
-                <td>${expandableCell(row.potential_weakness, `weak-${index}`)}</td>
-                <td>${row.source_paper_link ? `<a href="${escapeHtml(row.source_paper_link)}" target="_blank" rel="noreferrer">${escapeHtml(row.venue_or_source || row.year || "paper")}</a>` : escapeHtml(`${row.venue_or_source || ""} ${row.year || ""}`)}</td>
-              </tr>
-            `
-          )
-          .join("")}
-      </tbody>
-    </table>
+    <div class="comparison-scroll">
+      <table class="comparison-table">
+        <thead>
+          <tr>
+            <th>Existed Idea</th>
+            <th>Mechanistic Similarity</th>
+            <th>Essential Difference</th>
+            <th>Potential Advantage</th>
+            <th>Potential Weakness</th>
+            <th>Source</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${relatedRows
+            .map(
+              (row, index) => `
+                <tr>
+                  <td><button type="button" class="link-button" data-related-index="${index}">${escapeHtml(row.title || row.source_paper_title || row.id || "Existed Idea")}</button></td>
+                  <td><strong>${escapeHtml(row.similarity)}</strong>${expandableCell(row.similarity_points || "", `sim-${index}`)}</td>
+                  <td>${expandableCell(row.differences, `diff-${index}`)}</td>
+                  <td>${expandableCell(row.potential_advantage, `adv-${index}`)}</td>
+                  <td>${expandableCell(row.potential_weakness, `weak-${index}`)}</td>
+                  <td>${row.source_paper_link ? `<a href="${escapeHtml(row.source_paper_link)}" target="_blank" rel="noreferrer">${escapeHtml(row.venue_or_source || row.year || "paper")}</a>` : escapeHtml(`${row.venue_or_source || ""} ${row.year || ""}`)}</td>
+                </tr>
+              `
+            )
+            .join("")}
+        </tbody>
+      </table>
+    </div>
   `;
+}
+
+function compactGraphNodes(nodes, options = {}) {
+  const width = Number(options.width || 250);
+  const verticalGap = Number(options.verticalGap || options.rowGap || 24);
+  const top = Number(options.top || 76);
+  const left = Number(options.left || 64);
+  const laneGap = Number(options.laneGap || 48);
+  const rowsPerLane = Math.max(1, Number(options.rowsPerLane || 3));
+  const minHeight = Number(options.minHeight || 92);
+  const maxHeight = Number(options.maxHeight || 150);
+  const byColumn = new Map();
+  for (const node of nodes || []) {
+    const rawX = Number(node.x || left);
+    const columnKey = Math.round(rawX / 120) * 120;
+    if (!byColumn.has(columnKey)) byColumn.set(columnKey, []);
+    byColumn.get(columnKey).push(node);
+  }
+  const columns = [...byColumn.entries()].sort(([a], [b]) => a - b);
+  let cursorX = left;
+  const positioned = [];
+  for (const [, columnNodes] of columns) {
+    columnNodes.sort((a, b) => Number(a.y || 0) - Number(b.y || 0) || String(a.label || a.id || "").localeCompare(String(b.label || b.id || "")));
+    const lanes = Math.max(1, Math.ceil(columnNodes.length / rowsPerLane));
+    const laneY = Array.from({ length: lanes }, () => top);
+    columnNodes.forEach((node, index) => {
+      const lane = index % lanes;
+      const height = estimateGraphNodeHeight(node, { minHeight, maxHeight });
+      const y = laneY[lane];
+      laneY[lane] += height + verticalGap;
+      positioned.push({
+        ...node,
+        graphHeight: height,
+        x: cursorX + lane * (width + laneGap),
+        y,
+      });
+    });
+    cursorX += lanes * (width + laneGap) + Number(options.columnGap || 70);
+  }
+  return positioned;
+}
+
+function estimateGraphNodeHeight(node, options = {}) {
+  const minHeight = Number(options.minHeight || 92);
+  const maxHeight = Number(options.maxHeight || 150);
+  const text = [
+    node.full_label,
+    node.label,
+    node.summary,
+    node.expression,
+    node.source_paper_title,
+  ].filter(Boolean).join(" ");
+  const lines = Math.ceil(compact(text, 360).length / 54);
+  return clampNumber(minHeight + Math.max(0, lines - 2) * 17, minHeight, maxHeight);
+}
+
+function principleNodeHeight(node) {
+  return Number(node?.graphHeight || 96);
+}
+
+function lineageNodeHeight(node) {
+  return Number(node?.graphHeight || 104);
+}
+
+function graphEdgeLabelY(index, y1, y2, contentHeight, spread = 24) {
+  const offsets = [-2, 2, -4, 4, 0].map((value) => value * spread);
+  const y = Math.round((Number(y1 || 0) + Number(y2 || 0)) / 2) + offsets[index % offsets.length];
+  return clampNumber(y, 30, Math.max(30, Number(contentHeight || 360) - 30));
+}
+
+function estimateGraphLabelWidth(text) {
+  return clampNumber(String(text || "").length * 7.4 + 18, 44, 190);
+}
+
+function graphRectOverlaps(a, b) {
+  return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+}
+
+function graphRectOverlapArea(a, b) {
+  if (!graphRectOverlaps(a, b)) return 0;
+  return Math.max(0, Math.min(a.right, b.right) - Math.max(a.left, b.left)) * Math.max(0, Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top));
+}
+
+function graphEdgeLabelPoint(index, source, target, nodes, options = {}) {
+  const nodeWidth = Number(options.nodeWidth || 220);
+  const contentWidth = Number(options.contentWidth || 980);
+  const contentHeight = Number(options.contentHeight || 420);
+  const heightForNode = options.heightForNode || (() => 110);
+  const text = options.text || "";
+  const labelWidth = estimateGraphLabelWidth(text);
+  const labelHeight = 22;
+  const x1 = Number(options.x1 || 0);
+  const x2 = Number(options.x2 || 0);
+  const y1 = Number(options.y1 || 0);
+  const y2 = Number(options.y2 || 0);
+  const sourceLeft = Number(source?.x || 0);
+  const sourceRight = sourceLeft + nodeWidth;
+  const targetLeft = Number(target?.x || 0);
+  const targetRight = targetLeft + nodeWidth;
+  const sourceBeforeTarget = sourceRight <= targetLeft;
+  const targetBeforeSource = targetRight <= sourceLeft;
+  const gapLeft = sourceBeforeTarget ? sourceRight : targetBeforeSource ? targetRight : Math.min(sourceRight, targetRight);
+  const gapRight = sourceBeforeTarget ? targetLeft : targetBeforeSource ? sourceLeft : Math.max(sourceLeft, targetLeft);
+  const gapWidth = Math.max(0, gapRight - gapLeft);
+  const channelX = gapWidth >= labelWidth + 8 ? Math.round((gapLeft + gapRight) / 2) : Math.round((x1 + x2) / 2);
+  const baseY = Math.round((y1 + y2) / 2);
+  const minX = 28 + labelWidth / 2;
+  const maxX = Math.max(minX, contentWidth - 28 - labelWidth / 2);
+  const minY = 28 + labelHeight / 2;
+  const maxY = Math.max(minY, contentHeight - 28 - labelHeight / 2);
+  const nodeRects = (nodes || []).map((node) => ({
+    left: Number(node.x || 0) - 8,
+    right: Number(node.x || 0) + nodeWidth + 8,
+    top: Number(node.y || 0) - 8,
+    bottom: Number(node.y || 0) + Number(heightForNode(node) || 110) + 8,
+  }));
+  const xOffsets = [0, -36, 36, -78, 78, -126, 126, -180, 180, -240, 240];
+  const spread = Number(options.spread || 24);
+  const stagger = [-1, 1, -2, 2, 0][index % 5] * spread;
+  const yOffsets = [stagger, 0, -36, 36, -72, 72, -112, 112, -156, 156, -220, 220, -300, 300];
+  let best = null;
+  for (const yOffset of yOffsets) {
+    for (const xOffset of xOffsets) {
+      const x = clampNumber(channelX + xOffset, minX, maxX);
+      const y = clampNumber(baseY + yOffset, minY, maxY);
+      const rect = {
+        left: x - labelWidth / 2,
+        right: x + labelWidth / 2,
+        top: y - labelHeight / 2,
+        bottom: y + labelHeight / 2,
+      };
+      const overlapArea = nodeRects.reduce((total, nodeRect) => total + graphRectOverlapArea(rect, nodeRect), 0);
+      const distancePenalty = Math.abs(x - channelX) * 0.08 + Math.abs(y - baseY) * 0.04;
+      const score = overlapArea * 1000 + distancePenalty;
+      const candidate = { x: Math.round(x), y: Math.round(y), score, overlapArea };
+      if (!best || candidate.score < best.score) best = candidate;
+      if (overlapArea === 0) return candidate;
+    }
+  }
+  if (best && best.overlapArea <= 0) return best;
+  const edgeTop = Math.min(y1, y2);
+  const edgeBottom = Math.max(y1, y2);
+  const outside = edgeTop > contentHeight - edgeBottom
+    ? clampNumber(edgeTop - labelHeight - 18 - (index % 3) * 18, minY, maxY)
+    : clampNumber(edgeBottom + labelHeight + 18 + (index % 3) * 18, minY, maxY);
+  return best && best.overlapArea === 0
+    ? best
+    : { x: Math.round(clampNumber(channelX, minX, maxX)), y: Math.round(outside) };
 }
 
 function renderPrincipleMap(map) {
   const nodes = map?.nodes || [];
   const edges = map?.edges || [];
   principleMapData = map || {};
-  principleNodes = nodes;
+  const positioned = compactGraphNodes(nodes, { width: 250, rowsPerLane: 3, verticalGap: 44, top: 78, left: 54, laneGap: 58, columnGap: 112, minHeight: 96, maxHeight: 152 });
+  principleNodes = positioned;
   principleEdges = edges;
   if (!nodes.length) return `<p class="muted">No principle map has been derived yet.</p>`;
-  const byId = new Map(nodes.map((node) => [node.id, node]));
-  const height = Math.max(520, ...nodes.map((node) => Number(node.y || 80) + 120));
+  const byId = new Map(positioned.map((node) => [node.id, node]));
+  const width = Math.max(980, ...positioned.map((node) => Number(node.x || 80) + 290));
+  const contentHeight = Math.max(360, ...positioned.map((node) => Number(node.y || 80) + principleNodeHeight(node) + 54));
+  const viewportHeight = graphViewportHeight("principle", clampNumber(contentHeight, 420, 680));
   const edgeHtml = edges
     .map((edge, edgeIndex) => {
       const source = byId.get(edge.source);
       const target = byId.get(edge.target);
       if (!source || !target) return "";
       const x1 = Number(source.x || 80) + 250;
-      const y1 = Number(source.y || 80) + 42;
+      const y1 = Number(source.y || 80) + Math.round(principleNodeHeight(source) / 2);
       const x2 = Number(target.x || 680);
-      const y2 = Number(target.y || 80) + 42;
+      const y2 = Number(target.y || 80) + Math.round(principleNodeHeight(target) / 2);
       const mid = Math.round((x1 + x2) / 2);
       return `
         <path data-edge-index="${edgeIndex}" class="principle-edge ${edgeIndex === selectedEdgeIndex ? "selected" : ""} ${escapeHtml(edge.relation || "related")}" d="M ${x1} ${y1} C ${mid} ${y1}, ${mid} ${y2}, ${x2} ${y2}" />
-        <text data-edge-index="${edgeIndex}" class="principle-edge-label ${edgeIndex === selectedEdgeIndex ? "selected" : ""}" x="${mid - 36}" y="${Math.round((y1 + y2) / 2) - 6}">${escapeHtml((edge.relation || "related").replaceAll("_", " "))}</text>
       `;
     })
     .join("");
-  const nodeHtml = nodes
+  const labelHtml = edges
+    .map((edge, edgeIndex) => {
+      const source = byId.get(edge.source);
+      const target = byId.get(edge.target);
+      if (!source || !target) return "";
+      const x1 = Number(source.x || 80) + 250;
+      const y1 = Number(source.y || 80) + Math.round(principleNodeHeight(source) / 2);
+      const x2 = Number(target.x || 680);
+      const y2 = Number(target.y || 80) + Math.round(principleNodeHeight(target) / 2);
+      const mid = Math.round((x1 + x2) / 2);
+      const labelText = (edge.relation || "related").replaceAll("_", " ");
+      const point = graphEdgeLabelPoint(edgeIndex, source, target, positioned, {
+        text: labelText,
+        nodeWidth: 250,
+        heightForNode: principleNodeHeight,
+        contentWidth: width,
+        contentHeight,
+        x1,
+        y1,
+        x2,
+        y2,
+        spread: 18,
+      });
+      return `<text data-edge-index="${edgeIndex}" class="principle-edge-label ${edgeIndex === selectedEdgeIndex ? "selected" : ""}" x="${point.x}" y="${point.y}">${escapeHtml(labelText)}</text>`;
+    })
+    .join("");
+  const nodeHtml = positioned
     .map(
       (node, index) => `
-        <button type="button" draggable="true" class="principle-map-node ${escapeHtml(node.type || "")}" style="left:${Number(node.x || 80)}px; top:${Number(node.y || 80)}px" data-principle-index="${index}">
+        <button type="button" draggable="true" class="principle-map-node ${escapeHtml(node.type || "")}" style="left:${Number(node.x || 80)}px; top:${Number(node.y || 80)}px; height:${principleNodeHeight(node)}px" data-principle-index="${index}">
           <span>${escapeHtml((node.type || "principle").replaceAll("_", " "))}</span>
-          <strong title="${escapeHtml(node.full_label || node.label || node.id || "Principle")}">${escapeHtml(node.label || node.id || "Principle")}</strong>
-          <small>${escapeHtml(node.source_paper_title || node.layer || "")}</small>
+          <strong title="${escapeHtml(node.full_label || node.label || node.id || "Principle")}">${escapeHtml(compact(node.label || node.id || "Principle", 96))}</strong>
+          <small>${escapeHtml(compact(node.source_paper_title || node.layer || "", 112))}</small>
         </button>
       `
     )
     .join("");
-  const width = 980;
   const zoom = principleZoom;
   const surfaceWidth = Math.ceil(width * zoom);
-  const surfaceHeight = Math.ceil(height * zoom);
+  const surfaceHeight = Math.ceil(contentHeight * zoom);
   return `
     ${graphZoomControls("principle", zoom)}
-    <div class="principle-canvas" style="height:${height}px">
+    <div class="principle-canvas" data-graph-target="principle" style="height:${viewportHeight}px">
       <div class="graph-zoom-surface" style="width:${surfaceWidth}px; height:${surfaceHeight}px">
-        <div class="graph-zoom-layer" style="width:${width}px; height:${height}px; transform: scale(${zoom})">
+        <div class="graph-zoom-layer" style="width:${width}px; height:${contentHeight}px; transform: scale(${zoom})">
           <div class="canvas-legend">
             <span><i class="existing-dot"></i> Similar-idea principles</span>
             <span><i class="new-dot"></i> Generated idea principles</span>
           </div>
-          <svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">${edgeHtml}</svg>
+          <svg class="graph-edge-layer" width="${width}" height="${contentHeight}" viewBox="0 0 ${width} ${contentHeight}" preserveAspectRatio="none">${edgeHtml}</svg>
+          <svg class="graph-label-layer" width="${width}" height="${contentHeight}" viewBox="0 0 ${width} ${contentHeight}" preserveAspectRatio="none">${labelHtml}</svg>
           ${renderEdgeInspector()}
           ${nodeHtml}
         </div>
@@ -380,6 +842,30 @@ function renderSources(sources) {
       return `<article class="principle-node"><p class="eyebrow">${escapeHtml(ref.bucket)}</p><h3>${escapeHtml(item.title || item.name || item.id || ref.id)}</h3><p>${escapeHtml(item.idea_text || item.message_text || item.abstract_signature || item.summary || "")}</p></article>`;
     })
     .join("");
+}
+
+function renderIdeaCore(idea = currentIdea || {}, project = currentProject || {}, meta = currentMeta || {}) {
+  document.getElementById("ideaCore").innerHTML = `
+    ${block("Project Context", [`Project: ${project.name || idea.field_id || ""}`, `Goal: ${project.goal_text || project.query || ""}`])}
+    ${block("Novelty Claim", idea.novelty_claim)}
+    ${block("Mechanistic Design", idea.mechanistic_design)}
+    ${block("Method Variants", idea.method_variants)}
+    ${block("Derived Principles", idea.derived_principles)}
+    ${block("Why It Might Work", idea.why_it_might_work)}
+    ${block("Validation Protocol", idea.validation_protocol)}
+    ${block("Relevant Baselines", idea.relevant_baselines)}
+    ${block("Reasoning Trace", idea.reasoning_trace || idea.branching_summary || idea.self_feedback)}
+    ${block("Metrics", idea.metrics)}
+    ${block("Risks", idea.risks)}
+    ${block("User Note", realUserNote(idea))}
+    ${block("Generation Metadata", [
+      `Mode: ${meta.generation_mode || idea.generation_mode || "unknown"}`,
+      `Model: ${meta.provider || ""} / ${meta.model_name || idea.model_name || ""}`,
+      `Created: ${meta.created_at || idea.created_at || ""}`,
+      `Selected evidence: ${(meta.selected_refs || idea.selected_refs || []).length}`,
+      meta.llm_error || idea.llm_error || "",
+    ].filter(Boolean))}
+  `;
 }
 
 async function openRelated(index) {
@@ -415,34 +901,17 @@ async function init() {
   const meta = data.generation_meta || {};
   currentIdea = idea;
   currentMeta = meta;
+  currentProject = project;
   referenceLabels = data.reference_labels || {};
   comparisonWarning = data.comparison_warning || "";
   renderIdeaControls(idea, meta);
   document.getElementById("ideaTitle").textContent = idea.title || "My Idea";
   document.getElementById("ideaThesis").textContent = idea.one_sentence_thesis || idea.novelty_claim || "";
-  document.getElementById("ideaCore").innerHTML = `
-    ${block("Project Context", [`Project: ${project.name || idea.field_id || ""}`, `Goal: ${project.goal_text || project.query || ""}`])}
-    ${block("Novelty Claim", idea.novelty_claim)}
-    ${block("Mechanistic Design", idea.mechanistic_design)}
-    ${block("Method Variants", idea.method_variants)}
-    ${block("Derived Principles", idea.derived_principles)}
-    ${block("Why It Might Work", idea.why_it_might_work)}
-    ${block("Validation Protocol", idea.validation_protocol)}
-    ${block("Relevant Baselines", idea.relevant_baselines)}
-    ${block("Metrics", idea.metrics)}
-    ${block("Risks", idea.risks)}
-    ${block("User Note", realUserNote(idea))}
-    ${block("Generation Metadata", [
-      `Mode: ${meta.generation_mode || idea.generation_mode || "unknown"}`,
-      `Model: ${meta.provider || ""} / ${meta.model_name || idea.model_name || ""}`,
-      `Created: ${meta.created_at || idea.created_at || ""}`,
-      `Selected evidence: ${(meta.selected_refs || idea.selected_refs || []).length}`,
-      meta.llm_error || idea.llm_error || "",
-    ].filter(Boolean))}
-  `;
+  renderIdeaCore(idea, project, meta);
   document.getElementById("relatedTable").innerHTML = renderRelated(data.related_existed_ideas || []);
   if (!relatedComparisonRunId) document.getElementById("relatedComparisonStatus").textContent = relatedRows.length ? `Current comparison has ${relatedRows.length} row${relatedRows.length === 1 ? "" : "s"}.` : "";
   document.getElementById("principleMap").innerHTML = renderPrincipleMap(data.principle_map || {});
+  scheduleGraphResizeWiring("principle");
   document.getElementById("sourceEvidence").innerHTML = renderSources(data.source_evidence || []);
   loadSymbolicLineage().catch(() => {
     document.getElementById("symbolicLineage").innerHTML = `<p class="muted">No symbolic lineage graph is available for this idea version.</p>`;
@@ -455,6 +924,9 @@ async function loadSymbolicLineage() {
   if (!ideaId) return;
   const graph = await api(`/api/v1/ideas/${encodeURIComponent(ideaId)}/lineage`);
   document.getElementById("symbolicLineage").innerHTML = renderLineageGraph(graph);
+  scheduleGraphResizeWiring("lineage");
+  renderIdeaCore(currentIdea, currentProject, currentMeta);
+  typesetMath(document.getElementById("ideaCore"));
   typesetMath(document.getElementById("symbolicLineage"));
 }
 
@@ -467,15 +939,27 @@ function renderLineageGraph(graph) {
   if (!nodes.length) return `<p class="muted">No symbolic lineage graph is available for this idea version.</p>`;
   const depths = [...new Set(nodes.map((node) => Number(node.speculation_depth || 0)).sort((a, b) => a - b))];
   const byDepth = new Map(depths.map((depth) => [depth, nodes.filter((node) => Number(node.speculation_depth || 0) === depth)]));
-  const positioned = nodes.map((node) => {
-    const depth = Number(node.speculation_depth || 0);
-    const layer = depths.indexOf(depth);
-    const row = byDepth.get(depth)?.findIndex((entry) => entry.id === node.id) ?? 0;
-    return {
-      ...node,
-      x: 42 + layer * 290,
-      y: 96 + row * 168,
-    };
+  const nodeWidth = 210;
+  const columnGap = 150;
+  const top = 92;
+  const rowGap = 34;
+  const measuredGroups = depths.map((depth) => {
+    const group = (byDepth.get(depth) || [])
+      .slice()
+      .sort((a, b) => String(lineageNodeDisplayLabel(a, a.label || a.id)).localeCompare(String(lineageNodeDisplayLabel(b, b.label || b.id))))
+      .map((node) => ({ ...node, graphHeight: estimateGraphNodeHeight(node, { minHeight: 106, maxHeight: 164 }) }));
+    const height = group.reduce((total, node) => total + lineageNodeHeight(node), 0) + Math.max(0, group.length - 1) * rowGap;
+    return { depth, group, height };
+  });
+  const tallestColumn = Math.max(0, ...measuredGroups.map((group) => group.height));
+  const positioned = [];
+  measuredGroups.forEach((column, columnIndex) => {
+    let cursorY = top + Math.max(0, Math.round((tallestColumn - column.height) / 2));
+    const x = 54 + columnIndex * (nodeWidth + columnGap);
+    column.group.forEach((node) => {
+      positioned.push({ ...node, x, y: cursorY });
+      cursorY += lineageNodeHeight(node) + rowGap;
+    });
   });
   lineageNodes = positioned;
   lineageSymbolLabels = Object.fromEntries(
@@ -484,35 +968,62 @@ function renderLineageGraph(graph) {
       .filter(([symbol]) => symbol && symbol.length <= 48)
   );
   const byId = Object.fromEntries(positioned.map((node) => [node.id, node]));
-  const width = Math.max(940, ...positioned.map((node) => node.x + 250));
-  const height = Math.max(760, ...positioned.map((node) => node.y + 170));
+  const width = Math.max(940, ...positioned.map((node) => node.x + 260));
+  const contentHeight = Math.max(380, ...positioned.map((node) => node.y + lineageNodeHeight(node) + 72));
+  const viewportHeight = graphViewportHeight("lineage", clampNumber(contentHeight, 440, 700));
   const zoom = lineageZoom;
   const surfaceWidth = Math.ceil(width * zoom);
-  const surfaceHeight = Math.ceil(height * zoom);
+  const surfaceHeight = Math.ceil(contentHeight * zoom);
   const edgeHtml = edges
     .map((edge, index) => {
       const source = byId[edge.source];
       const target = byId[edge.target];
       if (!source || !target) return "";
       const x1 = source.x + 210;
-      const y1 = source.y + 48;
+      const y1 = source.y + Math.round(lineageNodeHeight(source) / 2);
       const x2 = target.x;
-      const y2 = target.y + 48;
+      const y2 = target.y + Math.round(lineageNodeHeight(target) / 2);
       const mid = Math.round((x1 + x2) / 2);
       const selected = index === selectedLineageEdgeIndex ? "selected" : "";
       return `
         <path data-lineage-edge-index="${index}" class="lineage-edge ${selected}" d="M ${x1} ${y1} C ${mid} ${y1}, ${mid} ${y2}, ${x2} ${y2}" />
-        <text data-lineage-edge-index="${index}" class="lineage-edge-label ${selected}" x="${mid - 34}" y="${Math.round((y1 + y2) / 2) - 7}">${escapeHtml((edge.label || "supports").replaceAll("_", " "))}</text>
       `;
+    })
+    .join("");
+  const labelHtml = edges
+    .map((edge, index) => {
+      const source = byId[edge.source];
+      const target = byId[edge.target];
+      if (!source || !target) return "";
+      const x1 = source.x + 210;
+      const y1 = source.y + Math.round(lineageNodeHeight(source) / 2);
+      const x2 = target.x;
+      const y2 = target.y + Math.round(lineageNodeHeight(target) / 2);
+      const mid = Math.round((x1 + x2) / 2);
+      const selected = index === selectedLineageEdgeIndex ? "selected" : "";
+      const labelText = (edge.label || "supports").replaceAll("_", " ");
+      const point = graphEdgeLabelPoint(index, source, target, positioned, {
+        text: labelText,
+        nodeWidth: 210,
+        heightForNode: lineageNodeHeight,
+        contentWidth: width,
+        contentHeight,
+        x1,
+        y1,
+        x2,
+        y2,
+        spread: 20,
+      });
+      return `<text data-lineage-edge-index="${index}" class="lineage-edge-label ${selected}" x="${point.x}" y="${point.y}">${escapeHtml(labelText)}</text>`;
     })
     .join("");
   const nodeHtml = positioned
     .map(
       (node, index) => `
-        <button type="button" class="lineage-graph-node ${escapeHtml(node.type || "")} ${escapeHtml(node.validation_status || "")}" style="left:${node.x}px; top:${node.y}px" data-lineage-node-index="${index}">
+        <button type="button" class="lineage-graph-node ${escapeHtml(node.type || "")} ${escapeHtml(node.validation_status || "")}" style="left:${node.x}px; top:${node.y}px; height:${lineageNodeHeight(node)}px" data-lineage-node-index="${index}">
           <span>${escapeHtml(node.type || "node")} · L${escapeHtml(node.speculation_depth ?? 0)}</span>
-          <strong>${escapeHtml(node.label || node.id)}</strong>
-          <small>${escapeHtml(node.summary || node.expression || "Click to inspect this derivation node.")}</small>
+          <strong>${escapeHtml(compact(lineageNodeDisplayLabel(node, node.label || node.id), 96))}</strong>
+          <small>${escapeHtml(compact(node.summary || node.expression || "Click to inspect this derivation node.", 150))}</small>
         </button>
       `
     )
@@ -526,10 +1037,11 @@ function renderLineageGraph(graph) {
         <span class="badge">${escapeHtml(graph.derivation?.status || "lineage")}</span>
       </div>
       ${graphZoomControls("lineage", zoom)}
-      <div class="lineage-canvas" style="height:${height}px">
+      <div class="lineage-canvas" data-graph-target="lineage" style="height:${viewportHeight}px">
         <div class="graph-zoom-surface" style="width:${surfaceWidth}px; height:${surfaceHeight}px">
-          <div class="graph-zoom-layer" style="width:${width}px; height:${height}px; transform: scale(${zoom})">
-            <svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">${edgeHtml}</svg>
+          <div class="graph-zoom-layer" style="width:${width}px; height:${contentHeight}px; transform: scale(${zoom})">
+            <svg class="graph-edge-layer" width="${width}" height="${contentHeight}" viewBox="0 0 ${width} ${contentHeight}" preserveAspectRatio="none">${edgeHtml}</svg>
+            <svg class="graph-label-layer" width="${width}" height="${contentHeight}" viewBox="0 0 ${width} ${contentHeight}" preserveAspectRatio="none">${labelHtml}</svg>
             ${nodeHtml}
           </div>
         </div>
@@ -982,7 +1494,13 @@ async function openPrincipleNode(index) {
 function openLineageNode(index) {
   const node = lineageNodes[index];
   if (!node) return;
+  const ref = lineageNodeReference(node);
+  if (ref) {
+    openReferenceDetailBy(ref.bucket, ref.id, lineageNodeDisplayLabel(node, node.label || node.id));
+    return;
+  }
   showInfoModal("Lineage Node", node.label || node.id || "Derivation Node", `
+    ${block("Symbol", node.label || node.id)}
     ${block("Type", `${node.type || "node"} · depth ${node.speculation_depth ?? 0}`)}
     ${block("Validation", [node.validation_status || "", node.verifier_status || ""].filter(Boolean))}
     ${richBlock("Expression", node.expression)}
@@ -994,7 +1512,13 @@ function openLineageNode(index) {
 function openLineageSymbol(symbolCode) {
   const node = lineageSymbolLabels[String(symbolCode || "").trim()];
   if (!node) return;
-  showInfoModal("Symbol", node.label || symbolCode || "Symbol", `
+  const ref = lineageNodeReference(node);
+  if (ref) {
+    openReferenceDetailBy(ref.bucket, ref.id, lineageNodeDisplayLabel(node, symbolCode));
+    return;
+  }
+  showInfoModal("Symbol", lineageNodeDisplayLabel(node, symbolCode) || symbolCode || "Symbol", `
+    ${block("Symbol", node.label || symbolCode)}
     ${block("Type", `${node.type || "node"} · depth ${node.speculation_depth ?? 0}`)}
     ${block("Validation", [node.validation_status || "", node.verifier_status || ""].filter(Boolean))}
     ${richBlock("Expression", node.expression)}
@@ -1008,6 +1532,7 @@ function openLineageEdge(index) {
   const edge = lineageEdges[index];
   if (!edge) return;
   document.getElementById("symbolicLineage").innerHTML = renderLineageGraph(lineageGraphData || {});
+  scheduleGraphResizeWiring("lineage");
   const byId = Object.fromEntries(lineageNodes.map((node) => [node.id, node]));
   showInfoModal("Lineage Edge", (edge.label || "supports").replaceAll("_", " "), `
     ${block("Source", byId[edge.source]?.label || edge.source)}
@@ -1063,46 +1588,73 @@ function openActiveModalDetail() {
 function selectPrincipleEdge(index) {
   selectedEdgeIndex = index;
   document.getElementById("principleMap").innerHTML = renderPrincipleMap(principleMapData || {});
+  scheduleGraphResizeWiring("principle");
 }
 
 function updatePrincipleEdges() {
   const byId = new Map(principleNodes.map((node) => [node.id, node]));
+  const dims = ensureGraphBounds("principle", principleNodes, 250, principleNodeHeight, principleZoom, 180);
   principleEdges.forEach((edge, index) => {
     const source = byId.get(edge.source);
     const target = byId.get(edge.target);
     if (!source || !target) return;
     const x1 = Number(source.x || 80) + 250;
-    const y1 = Number(source.y || 80) + 42;
+    const y1 = Number(source.y || 80) + Math.round(principleNodeHeight(source) / 2);
     const x2 = Number(target.x || 680);
-    const y2 = Number(target.y || 80) + 42;
+    const y2 = Number(target.y || 80) + Math.round(principleNodeHeight(target) / 2);
     const mid = Math.round((x1 + x2) / 2);
     const path = document.querySelector(`.principle-edge[data-edge-index="${index}"]`);
     const label = document.querySelector(`.principle-edge-label[data-edge-index="${index}"]`);
     if (path) path.setAttribute("d", `M ${x1} ${y1} C ${mid} ${y1}, ${mid} ${y2}, ${x2} ${y2}`);
     if (label) {
-      label.setAttribute("x", String(mid - 36));
-      label.setAttribute("y", String(Math.round((y1 + y2) / 2) - 6));
+      const point = graphEdgeLabelPoint(index, source, target, principleNodes, {
+        text: label.textContent || edge.relation || "related",
+        nodeWidth: 250,
+        heightForNode: principleNodeHeight,
+        contentWidth: dims.width,
+        contentHeight: dims.height,
+        x1,
+        y1,
+        x2,
+        y2,
+        spread: 18,
+      });
+      label.setAttribute("x", String(point.x));
+      label.setAttribute("y", String(point.y));
     }
   });
 }
 
 function updateLineageEdges() {
   const byId = new Map(lineageNodes.map((node) => [node.id, node]));
+  const dims = ensureGraphBounds("lineage", lineageNodes, 210, lineageNodeHeight, lineageZoom, 180);
   lineageEdges.forEach((edge, index) => {
     const source = byId.get(edge.source);
     const target = byId.get(edge.target);
     if (!source || !target) return;
     const x1 = Number(source.x || 42) + 210;
-    const y1 = Number(source.y || 88) + 48;
+    const y1 = Number(source.y || 88) + Math.round(lineageNodeHeight(source) / 2);
     const x2 = Number(target.x || 42);
-    const y2 = Number(target.y || 88) + 48;
+    const y2 = Number(target.y || 88) + Math.round(lineageNodeHeight(target) / 2);
     const mid = Math.round((x1 + x2) / 2);
     const path = document.querySelector(`.lineage-edge[data-lineage-edge-index="${index}"]`);
     const label = document.querySelector(`.lineage-edge-label[data-lineage-edge-index="${index}"]`);
     if (path) path.setAttribute("d", `M ${x1} ${y1} C ${mid} ${y1}, ${mid} ${y2}, ${x2} ${y2}`);
     if (label) {
-      label.setAttribute("x", String(mid - 34));
-      label.setAttribute("y", String(Math.round((y1 + y2) / 2) - 7));
+      const point = graphEdgeLabelPoint(index, source, target, lineageNodes, {
+        text: label.textContent || edge.label || "supports",
+        nodeWidth: 210,
+        heightForNode: lineageNodeHeight,
+        contentWidth: dims.width,
+        contentHeight: dims.height,
+        x1,
+        y1,
+        x2,
+        y2,
+        spread: 20,
+      });
+      label.setAttribute("x", String(point.x));
+      label.setAttribute("y", String(point.y));
     }
   });
 }

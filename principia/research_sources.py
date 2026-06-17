@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import html as html_lib
 import re
 import shutil
 import ssl
@@ -64,8 +65,34 @@ def fetch_transient_full_text(work: dict[str, Any], *, timeout: int = 14, max_ch
         except Exception:
             continue
         if len(text) >= 500:
-            return compact_text(text, max_chars)
+            return compact_text(_clean_text(text), max_chars)
     return ""
+
+
+def recover_missing_abstract(work: dict[str, Any], *, timeout: int = 6, max_chars: int = 1800) -> dict[str, Any]:
+    """Fill an empty metadata abstract from DOI/landing-page metadata.
+
+    This keeps crawler records useful without storing full text. It only reads
+    short HTML metadata fields such as citation_abstract/description.
+    """
+
+    if compact_text(work.get("abstract") or "", max_chars):
+        return work
+    for url in _candidate_full_text_urls(work)[:4]:
+        try:
+            abstract = _fetch_landing_page_abstract(url, timeout=timeout, max_chars=max_chars)
+        except Exception:
+            continue
+        if abstract:
+            updated = dict(work)
+            updated["abstract"] = abstract
+            urls = _ordered_unique([*(updated.get("source_urls") or []), url])
+            updated["source_urls"] = urls
+            metadata = dict(updated.get("community_signals") or {})
+            metadata["abstract_recovered_from"] = url
+            updated["community_signals"] = metadata
+            return updated
+    return work
 
 
 def search_openalex(query: str, max_results: int = 50, timeout: int = 12) -> list[dict[str, Any]]:
@@ -216,6 +243,69 @@ def _fetch_url_text(url: str, *, timeout: int, max_chars: int) -> str:
     return compact_text(text, max_chars)
 
 
+def _fetch_landing_page_abstract(url: str, *, timeout: int, max_chars: int) -> str:
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml,*/*"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            content_type = resp.headers.get("Content-Type", "")
+            body = resp.read(1_500_000)
+    except Exception as exc:
+        if "CERTIFICATE_VERIFY_FAILED" not in repr(exc):
+            raise
+        with urllib.request.urlopen(req, timeout=timeout, context=ssl._create_unverified_context()) as resp:
+            content_type = resp.headers.get("Content-Type", "")
+            body = resp.read(1_500_000)
+    if "html" not in content_type.lower() and not body.lstrip().lower().startswith(b"<!doctype") and b"<html" not in body[:500].lower():
+        return ""
+    html = body.decode("utf-8", errors="replace")
+    for name in ("citation_abstract", "dc.description", "description", "og:description", "twitter:description"):
+        value = _html_meta_content(html, name)
+        if value and _looks_like_abstract(value):
+            return compact_text(value, max_chars)
+    json_ld = re.findall(r"(?is)<script[^>]+type=[\"']application/ld\\+json[\"'][^>]*>(.*?)</script>", html)
+    for block in json_ld:
+        try:
+            parsed = json.loads(html_lib.unescape(block.strip()))
+        except Exception:
+            continue
+        candidates = parsed if isinstance(parsed, list) else [parsed]
+        for item in candidates:
+            if isinstance(item, dict):
+                value = str(item.get("description") or item.get("abstract") or "").strip()
+                if value and _looks_like_abstract(value):
+                    return compact_text(_strip_tags(value), max_chars)
+    text = _strip_tags(re.sub(r"(?is)<(script|style|noscript).*?</\1>", " ", html))
+    match = re.search(r"(?is)\bAbstract\b\s*(.{220,4000}?)(?:\bKeywords\b|\bIntroduction\b|\bReferences\b|$)", text)
+    if match:
+        value = " ".join(match.group(1).split())
+        if _looks_like_abstract(value):
+            return compact_text(value, max_chars)
+    return ""
+
+
+def _html_meta_content(html: str, name: str) -> str:
+    escaped = re.escape(name)
+    patterns = [
+        rf"(?is)<meta[^>]+(?:name|property)=[\"']{escaped}[\"'][^>]+content=[\"'](.*?)[\"']",
+        rf"(?is)<meta[^>]+content=[\"'](.*?)[\"'][^>]+(?:name|property)=[\"']{escaped}[\"']",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, html)
+        if match:
+            return _strip_tags(html_lib.unescape(match.group(1))).strip()
+    return ""
+
+
+def _looks_like_abstract(value: str) -> bool:
+    text = " ".join(str(value or "").split())
+    if len(text) < 120:
+        return False
+    lowered = text.lower()
+    if any(term in lowered for term in ("cookie", "javascript", "enable your browser", "access this article")):
+        return False
+    return True
+
+
 def _pdf_bytes_to_text(body: bytes, *, max_chars: int) -> str:
     if not body:
         return ""
@@ -303,7 +393,11 @@ def _title_key(title: str) -> str:
 
 
 def _clean_text(value: str) -> str:
-    return " ".join(str(value or "").split())
+    text = str(value or "")
+    # Repair PDF line-wrap artifacts such as "scien- tific" before collapsing
+    # whitespace. Do not touch ordinary in-word hyphens like "test-time".
+    text = re.sub(r"(?<=[A-Za-z])-\s+(?=[a-z])", "", text)
+    return " ".join(text.split())
 
 
 def _strip_tags(value: str) -> str:

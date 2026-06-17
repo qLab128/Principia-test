@@ -4,8 +4,8 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Principia Cloud Library</title>
-    <link rel="stylesheet" href="/styles.css" />
-    <link rel="stylesheet" href="/cloud.css" />
+    <link rel="stylesheet" href="/styles.css?v=cloud-queue-stable-1" />
+    <link rel="stylesheet" href="/cloud.css?v=cloud-queue-stable-1" />
   </head>
   <body>
     <main class="cloud-shell">
@@ -52,7 +52,7 @@
             <div class="form-grid">
               <label>
                 <span>LLM</span>
-                <select id="crawlModelMode"></select>
+                <select id="crawlModelMode" aria-label="LLM"></select>
               </label>
               <label>
                 <span>Paper Count</span>
@@ -63,6 +63,10 @@
                 <input id="crawlTimeout" type="number" min="3" max="30" value="12" />
               </label>
               <label>
+                <span>Parallel API Calls</span>
+                <input id="crawlParallelism" type="number" min="1" max="8" value="4" />
+              </label>
+              <label>
                 <span>Admin Key</span>
                 <input id="adminKey" type="password" autocomplete="off" placeholder="Optional for local export" />
               </label>
@@ -70,7 +74,7 @@
 
             <label class="full-field">
               <span>Topic</span>
-              <input id="crawlTopics" type="search" autocomplete="off" placeholder="e.g. test-time adaptation, multimodal agents" />
+              <input id="crawlTopics" type="search" autocomplete="off" aria-label="Topic" placeholder="e.g. test-time adaptation, multimodal agents" />
             </label>
 
             <fieldset class="choice-group">
@@ -88,32 +92,32 @@
               <div id="priorityChoices" class="chip-grid"></div>
             </fieldset>
 
-            <label class="checkbox-line">
-              <input id="crawlForce" type="checkbox" />
-              <span>Force fresh extraction even when local/cloud coverage exists</span>
-            </label>
-
             <div class="button-row">
-              <button id="planCrawl" type="submit">Add Matching Papers to Queue</button>
+              <button id="planCrawl" type="submit">Search</button>
+              <button id="cancelSearch" type="button" class="danger-light" disabled data-allow-busy="true">Cancel Search</button>
             </div>
           </form>
 
           <aside class="candidate-panel">
             <div class="panel-head">
               <div>
-                <h3>Queued Papers</h3>
-                <span id="crawlCount">0 queued</span>
+                <h3>Searched Papers</h3>
+                <span id="crawlCount">0 found</span>
               </div>
               <div class="mini-actions">
-                <button id="selectAllCandidates" type="button">Refresh</button>
-                <button id="clearCandidateSelection" type="button">Clear Queue</button>
+                <button id="clearCandidateSelection" type="button">Clear Results</button>
               </div>
             </div>
             <div id="candidateList" class="candidate-list">
               <div class="empty-state compact">
-                <strong>No queued papers yet.</strong>
-                <span>Choose filters and add matching papers to the queue.</span>
+                <strong>No searched papers yet.</strong>
+                <span>Choose filters and run a search.</span>
               </div>
+            </div>
+            <div class="queue-add-actions">
+              <button id="addSearchResultsToQueue" type="button" class="more-btn" disabled>Add Matching Papers to Queue</button>
+              <button id="pauseQueueAdd" type="button" disabled data-allow-busy="true">Pause</button>
+              <button id="cancelQueueAdd" type="button" class="danger-light" disabled data-allow-busy="true">Cancel Add</button>
             </div>
           </aside>
         </div>
@@ -132,6 +136,8 @@
             </select>
             <button id="syncUnsynced" type="button">Sync to Cloud</button>
             <button id="clearSyncedCache" type="button" class="danger-light">Clear Synced Cache</button>
+            <button id="clearQueuedPapers" type="button" class="danger-light">Clear Queued Papers</button>
+            <button id="clearResearchTasks" type="button" class="danger-light">Clear Research Tasks</button>
           </div>
         </div>
 
@@ -144,18 +150,23 @@
         </div>
 
         <div class="research-action-row">
-          <button id="runResearch" type="button" class="primary-action">Start Research on Queued Works</button>
-          <button id="stopResearch" type="button" class="danger-light" hidden data-allow-busy="true">Stop Research</button>
-          <span id="queueResearchHint">Research only runs on queued papers that are not already ready or synced.</span>
+          <button id="addAllQueuedToTasks" type="button">Add All Queued to Research Tasks</button>
+          <button id="runResearch" type="button" class="primary-action">Start Research</button>
+          <button id="stopResearch" type="button" class="danger-light" disabled data-allow-busy="true">Stop Research</button>
+            <span id="queueResearchHint">Queued papers can be filtered by LLM; research runs only use papers in Research Tasks.</span>
         </div>
 
         <nav id="localTabRow" class="tab-row cloud-tabs" aria-label="Unsynced local tabs"></nav>
         <div class="tab-toolbar cloud-toolbar">
-          <input id="localTabSearch" type="search" placeholder="Search unsynced local records" />
+          <input id="localTabSearch" type="search" aria-label="Search local unsynced records" placeholder="Search queued, ready, or extracted records" />
           <button id="reloadLocalTab" type="button">Reload</button>
         </div>
         <div id="localTabContent" class="tab-content cloud-tab-content" aria-live="polite"></div>
-        <button id="localMoreBtn" type="button" class="more-btn" hidden>Load More</button>
+        <div id="localMoreBtn" class="pager" hidden>
+          <button type="button" data-page-action="prev">Previous</button>
+          <span id="localPageInfo">Page 1</span>
+          <button type="button" data-page-action="next">Next</button>
+        </div>
         <p id="syncStatus" class="status-line"></p>
       </section>
 
@@ -171,15 +182,15 @@
           <div class="form-grid">
             <label class="wide-field">
               <span>Search Query</span>
-              <input id="cloudQuery" type="search" autocomplete="off" placeholder="title, DOI, arXiv ID, benchmark, baseline, method" />
+              <input id="cloudQuery" type="search" autocomplete="off" aria-label="Search Query" placeholder="title, DOI, arXiv ID, benchmark, baseline, method" />
             </label>
             <label>
               <span>Model Filter</span>
-              <select id="cloudModelMode"></select>
+              <select id="cloudModelMode" aria-label="Model Filter"></select>
             </label>
             <label>
               <span>Concept Filter</span>
-              <select id="conceptTypeFilter">
+              <select id="conceptTypeFilter" aria-label="Concept Filter">
                 <option value="">All extracted records</option>
                 <option value="principle">Principles</option>
                 <option value="existed_idea">Existed ideas</option>
@@ -206,7 +217,11 @@
 
         <nav id="cloudResultTabRow" class="tab-row cloud-tabs" aria-label="Cloud result tabs"></nav>
         <div id="cloudResults" class="tab-content cloud-tab-content" aria-live="polite"></div>
-        <button id="cloudMoreBtn" type="button" class="more-btn" hidden>Load More</button>
+        <div id="cloudMoreBtn" class="pager" hidden>
+          <button type="button" data-page-action="prev">Previous</button>
+          <span id="cloudPageInfo">Page 1</span>
+          <button type="button" data-page-action="next">Next</button>
+        </div>
       </section>
 
       <section class="cloud-section admin-section">
@@ -268,14 +283,50 @@
           </div>
         </header>
         <div id="detailBody" class="detail-body"></div>
-        <details class="raw-details">
-          <summary>Raw fields</summary>
-          <pre id="detailRaw">{}</pre>
-        </details>
+      </article>
+    </section>
+
+    <section id="queueFilterModal" class="modal-backdrop" hidden>
+      <article class="form-modal model-choice-modal" role="dialog" aria-modal="true" aria-labelledby="queueFilterTitle">
+        <header>
+          <div>
+            <p class="eyebrow">Queued Papers</p>
+            <h2 id="queueFilterTitle">Choose LLM Coverage Filter</h2>
+          </div>
+        </header>
+        <p class="subtle">All shows every queued paper. A specific LLM shows papers that still need that LLM version in the cloud database.</p>
+        <label>
+          <span>Queued-paper filter</span>
+          <select id="queueFilterMode"></select>
+        </label>
+        <div class="modal-actions">
+          <button id="applyQueueFilter" type="button" class="primary-action">Apply Filter</button>
+          <button id="cancelQueueFilter" type="button" class="secondary-btn">Cancel</button>
+        </div>
+      </article>
+    </section>
+
+    <section id="researchModelModal" class="modal-backdrop" hidden>
+      <article class="form-modal model-choice-modal" role="dialog" aria-modal="true" aria-labelledby="researchModelTitle">
+        <header>
+          <div>
+            <p class="eyebrow">Research Tasks</p>
+            <h2 id="researchModelTitle">Choose Research LLM</h2>
+          </div>
+        </header>
+        <p class="subtle">Only papers in the Research Tasks tab will be researched. Completed papers move to Ready Papers and the extracted tabs.</p>
+        <label>
+          <span>Research LLM</span>
+          <select id="researchModelMode"></select>
+        </label>
+        <div class="modal-actions">
+          <button id="confirmResearchModel" type="button" class="primary-action">Start Research</button>
+          <button id="cancelResearchModel" type="button" class="secondary-btn">Cancel</button>
+        </div>
       </article>
     </section>
 
     <div id="toastStack" class="toast-stack" aria-live="polite"></div>
-    <script src="/cloud.js"></script>
+    <script src="/cloud.js?v=cloud-queue-stable-1"></script>
   </body>
 </html>

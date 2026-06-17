@@ -15,6 +15,66 @@ function isUrl(value) {
   return /^https?:\/\//i.test(String(value || "").trim());
 }
 
+function compact(value, length = 180) {
+  const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  return text.length <= length ? text : `${text.slice(0, Math.max(0, length - 3)).trim()}...`;
+}
+
+function modelModeFromCloudKey(modelKey) {
+  return String(modelKey || "").split(":")[2] || "";
+}
+
+function modelNameFromCloudKey(modelKey) {
+  return String(modelKey || "").split(":")[1] || "";
+}
+
+function cloudOriginForItem(item) {
+  const origin = item.cloud_origin || item.active_variant?.payload?.cloud_origin || item.active_variant?.cloud_origin || {};
+  return origin && typeof origin === "object" ? origin : {};
+}
+
+function cloudOriginMatchesTarget(item) {
+  const origin = cloudOriginForItem(item);
+  if (!origin.cloud_snapshot_id) return false;
+  const mode = document.getElementById("itemModelMode")?.value || params.get("model_mode") || "auto";
+  if (mode === "auto") return true;
+  const originMode = origin.cloud_model_mode || origin.model_mode || modelModeFromCloudKey(origin.cloud_model_key || origin.model_key || "");
+  return originMode === mode;
+}
+
+function cloudSyncMatchesTarget(item) {
+  if (item.cloud_sync_status !== "synced") return false;
+  const mode = document.getElementById("itemModelMode")?.value || params.get("model_mode") || "auto";
+  if (mode === "auto") return true;
+  const syncByModel = item.cloud_sync_by_model && typeof item.cloud_sync_by_model === "object" ? item.cloud_sync_by_model : {};
+  const modes = [];
+  for (const key of [item.cloud_sync_model_key, item.model_key, ...Object.keys(syncByModel)].filter(Boolean)) {
+    const keyMode = modelModeFromCloudKey(key);
+    if (keyMode && !modes.includes(keyMode)) modes.push(keyMode);
+  }
+  for (const entry of Object.values(syncByModel)) {
+    if (entry?.model_mode && !modes.includes(entry.model_mode)) modes.push(entry.model_mode);
+  }
+  if (item.model_mode && !modes.includes(item.model_mode)) modes.push(item.model_mode);
+  return !modes.length || modes.includes(mode);
+}
+
+function cloudRecordMatchesTarget(item) {
+  return cloudOriginMatchesTarget(item) || cloudSyncMatchesTarget(item);
+}
+
+function renderCloudBadge(item) {
+  const badge = document.getElementById("itemCloudBadge");
+  if (!badge) return;
+  const origin = cloudOriginForItem(item);
+  const visible = cloudRecordMatchesTarget(item);
+  badge.hidden = !visible;
+  if (visible) {
+    const modelName = modelNameFromCloudKey(origin.cloud_model_key || origin.model_key || item.cloud_sync_model_key || item.model_key || "");
+    badge.title = modelName ? `Cloud DB record from ${modelName}` : "Cloud DB record";
+  }
+}
+
 async function api(path) {
   const response = await fetch(path);
   const payload = await response.json();
@@ -118,8 +178,103 @@ function versionBlock(item) {
   `;
 }
 
+function detailIdFor(bucket, item) {
+  return String(
+    item.detail_id ||
+      item.canonical_id ||
+      item.principle_id ||
+      item.benchmark_id ||
+      item.baseline_id ||
+      item.idea_id ||
+      item.work_id ||
+      ""
+  );
+}
+
+function detailTitleFor(bucket, item) {
+  if (bucket === "benchmark_records") return item.benchmark_name || item.dataset || item.canonical_label || "Benchmark";
+  if (bucket === "baseline_records") return item.baseline_name || item.canonical_label || "Baseline";
+  if (bucket === "principles") return item.name || item.title || item.argument || "Principle";
+  if (bucket === "takeaway_messages") return item.title || item.main_results || item.message_text || "Takeaway";
+  if (bucket === "existed_ideas") return item.title || item.core_idea || item.idea_text || "Existed Idea";
+  return item.title || item.name || item.work_id || "Record";
+}
+
+function detailSummaryFor(bucket, item) {
+  if (bucket === "benchmark_records") return item.task || item.description || item.payload_summary || "";
+  if (bucket === "baseline_records") return item.core_idea || item.methodology || item.description || item.payload_summary || "";
+  if (bucket === "principles") return item.argument || item.abstract_signature || item.payload_summary || "";
+  if (bucket === "takeaway_messages") return item.main_results || item.message_text || item.actionable_lesson || item.payload_summary || "";
+  if (bucket === "existed_ideas") return item.core_idea || item.idea_text || item.mechanism || item.payload_summary || "";
+  return item.summary || item.payload_summary || "";
+}
+
+function detailHref(bucket, id) {
+  const query = new URLSearchParams({
+    bucket,
+    id,
+    model_mode: params.get("model_mode") || document.getElementById("itemModelMode")?.value || "auto",
+  });
+  const fieldId = params.get("field_id") || "";
+  if (fieldId) query.set("field_id", fieldId);
+  return `/item.html?${query.toString()}`;
+}
+
+function workExtractionBlock(item) {
+  const groups = item.work_extractions?.groups || {};
+  const total = Number(item.work_extractions?.total || item.work_extraction_counts?.total || 0);
+  const modelSelect = document.getElementById("itemModelMode");
+  const selectedLabel = modelSelect?.selectedOptions?.[0]?.textContent?.trim() || "";
+  const modelName = selectedLabel || item.work_extractions?.model_mode || item.model_name || item.active_variant?.model_name || "";
+  const groupHtml = Object.entries(groups)
+    .filter(([, group]) => Number(group?.total || group?.items?.length || 0) > 0)
+    .map(([bucket, group]) => {
+      const rows = (group.items || []).slice(0, 20).map((record) => {
+        const id = detailIdFor(bucket, record);
+        const title = detailTitleFor(bucket, record);
+        const summary = detailSummaryFor(bucket, record);
+        return `
+          <li>
+            <a href="${escapeHtml(detailHref(bucket, id))}" target="_blank" rel="noreferrer">${escapeHtml(compact(title, 120))}</a>
+            ${summary ? `<p>${escapeHtml(compact(summary, 180))}</p>` : ""}
+          </li>
+        `;
+      });
+      return `
+        <section class="work-extraction-panel">
+          <h3>${escapeHtml(group.label || humanizeKey(bucket))} <span>${Number(group.total || group.items?.length || 0)}</span></h3>
+          <ul>${rows.join("")}</ul>
+        </section>
+      `;
+    })
+    .join("");
+  return `
+    <section class="wide-section work-extraction-overview">
+      <div class="section-heading-row">
+        <div>
+          <h2>Current LLM Extraction</h2>
+          <p>${escapeHtml(modelName ? `${modelName} · ${total} extracted item(s)` : `${total} extracted item(s)`)}</p>
+        </div>
+      </div>
+      ${groupHtml ? `<div class="work-extraction-grid">${groupHtml}</div>` : `<p class="subtle">No extracted records are available for this LLM version yet.</p>`}
+    </section>
+  `;
+}
+
 function renderItemBody(item, bucket) {
   const shared = `${linkBlock(item)}${sourceWorksBlock(item)}${block("Evidence", item.evidence)}${versionBlock(item)}`;
+  if (bucket === "source_works") {
+    return `
+      <div class="idea-grid">
+        ${block("Abstract", item.abstract || item.summary || "No abstract available.")}
+        ${block("Publication", [item.venue_or_source, item.year, item.source_type].filter(Boolean).join(" · "))}
+        ${block("Authors", item.authors)}
+      </div>
+      ${workExtractionBlock(item)}
+      ${linkBlock(item)}
+      ${versionBlock(item)}
+    `;
+  }
   if (bucket === "benchmark_records") {
     return `
       <div class="idea-grid">
@@ -435,10 +590,11 @@ async function deleteItem() {
 function renderLoadedItem(item, bucket) {
   document.getElementById("itemKind").textContent = bucket.replaceAll("_", " ") || "record";
   document.getElementById("itemTitle").textContent = item.title || item.name || item.benchmark_name || item.baseline_name || "Record";
+  renderControls(item);
+  renderCloudBadge(item);
   document.getElementById("itemSummary").textContent =
     item.idea_text || item.message_text || item.description || item.summary || item.abstract_signature || item.task || "";
   document.getElementById("itemBody").innerHTML = renderItemBody(item, bucket);
-  renderControls(item);
 }
 
 async function init() {
@@ -448,6 +604,7 @@ async function init() {
     id: params.get("id") || "",
     version: params.get("version") || "",
     model_mode: params.get("model_mode") || "auto",
+    field_id: params.get("field_id") || "default",
   });
   const data = await api(`/api/v2/item/detail?${query.toString()}`);
   const item = data.item || {};
@@ -459,8 +616,9 @@ document.getElementById("itemVersionSelect").addEventListener("change", async ()
   updateUrl(document.getElementById("itemVersionSelect").value || "", document.getElementById("itemModelMode").value || "auto");
   await init();
 });
-document.getElementById("itemModelMode").addEventListener("change", () => {
+document.getElementById("itemModelMode").addEventListener("change", async () => {
   updateUrl(document.getElementById("itemVersionSelect").value || "", document.getElementById("itemModelMode").value || "auto");
+  await init();
 });
 document.getElementById("editItemBtn").addEventListener("click", () => {
   document.getElementById("itemEditForm").hidden = false;

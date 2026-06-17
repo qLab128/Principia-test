@@ -8,7 +8,7 @@ from typing import Any
 from .cloud.compactor import compact_contributions, export_snapshot
 from .cloud.contribution import log_upload_status, prepare_contribution, upload_status
 from .cloud.crawler import plan_crawl
-from .cloud.github_client import maintainer_direct_push
+from .cloud.github_client import maintainer_direct_push, publish_cloud_contribution
 from .cloud.manifest import CloudManifestClient
 from .cloud.resolver import CloudResolver
 from .cloud.search import CloudSearch
@@ -337,10 +337,27 @@ def main(argv: list[str] | None = None) -> int:
                 state = "submitted" if direct_push.get("ok") and direct_push.get("pushed") else "prepared"
                 if not direct_push.get("ok"):
                     state = "error"
+                cloud_publish = (
+                    publish_cloud_contribution(
+                        args.path,
+                        ROOT_DIR,
+                        direct_push=direct_push,
+                        branch=args.branch or args.base_branch,
+                        remote=args.remote,
+                        base_branch=args.base_branch,
+                        trigger_workflow=not args.dry_run,
+                        local_snapshot=not args.dry_run,
+                    )
+                    if direct_push.get("ok") and (direct_push.get("pushed") or "already exists" in str(direct_push.get("message") or "").lower())
+                    else {}
+                )
+                if cloud_publish.get("ok") and cloud_publish.get("available_for_search"):
+                    state = "published"
                 print_json(
                     {
                         **log_upload_status(store.path, contribution_path=args.path, status=state, upload_mode=args.mode),
                         "direct_push": direct_push,
+                        "cloud_publish": cloud_publish,
                     }
                 )
             else:
