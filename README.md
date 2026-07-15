@@ -3,7 +3,6 @@
 Ideas from principles, validated by evidence.
 
 **Principia is a local-first research system for turning literature into reusable principles, composing those principles into traceable research ideas, and helping researchers inspect why an idea may be worth testing.**
-
 Principia now has two complementary surfaces:
 
 | Surface | Best for | How you use it |
